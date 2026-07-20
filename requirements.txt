@@ -1,0 +1,21 @@
+# --- Week 1: LLM APIs + tool calling ---
+google-genai
+groq
+yfinance
+jugaad-data
+python-dotenv
+
+# --- Week 2: agent loop (uncomment when you start) ---
+# langgraph
+# langchain-core
+
+# --- Week 3: RAG (uncomment when you start) ---
+# sentence-transformers
+# chromadb
+# tavily-python
+
+# --- Week 5: evals (uncomment when you start) ---
+# ragas
+
+# --- Week 6: deploy (uncomment when you start) ---
+# streamlit
