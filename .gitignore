@@ -19,3 +19,7 @@ chroma_db/
 # IDE
 .vscode/
 .idea/
+
+*_old.py
+
+tool_call_log.jsonl

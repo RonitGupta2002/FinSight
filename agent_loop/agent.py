@@ -26,7 +26,14 @@ from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from langgraph_tools import ALL_TOOLS
+from langgraph_tools import ALL_TOOLS as MARKET_TOOLS
+
+# --- Week 3 Part 3: bring in the RAG tools (search_filings, search_regulations)
+# alongside the 5 existing market-data tools ---
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rag"))
+from retrieval_tools import RAG_TOOLS
+
+ALL_TOOLS = MARKET_TOOLS + RAG_TOOLS
 
 MAX_ITERATIONS = 6  # safety cap — without this, a confused model can loop forever
                      # and burn your free-tier quota. Tune this up only if you hit
@@ -53,11 +60,23 @@ llm = ChatGoogleGenerativeAI(
     api_key=os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"),
 )
 llm_with_tools = llm.bind_tools(ALL_TOOLS)
+# Same model, no tools bound — used only as a last resort when the iteration
+# cap is hit mid-tool-call, so the model is forced to produce a text answer
+# instead of requesting yet another tool call it won't be allowed to make.
+llm_no_tools = llm
 
 SYSTEM_PROMPT = SystemMessage(content=(
     "You are a research assistant for Indian cash equity and F&O markets. "
-    "Use the tools available to you to answer with real data — don't guess numbers. "
-    "If no tool can answer part of a question, say so plainly instead of inventing data."
+    "You have tools for live market data (prices, fundamentals, option chains, repo rate), "
+    "company filings/concall transcripts (search_filings), and SEBI regulations (search_regulations). "
+    "Use the tools available to you to answer with real data — don't guess numbers or quote "
+    "regulations from memory. If no tool can answer part of a question, say so plainly instead "
+    "of inventing data.\n\n"
+    "Important: if a search tool returns relevant results, use them — do not repeat the same "
+    "search with only minor rewording hoping for a better match. If the user asks about a specific "
+    "period (e.g. 'Q3') but the available documents only cover a different period (e.g. 'Q1 FY27'), "
+    "use the most recent available data and clearly tell the user which period it actually covers, "
+    "rather than searching repeatedly for an exact label match that may not exist in the corpus."
 ))
 
 
@@ -85,9 +104,20 @@ def invoke_with_retry(messages):
     a multi-hop query alone can exhaust it, so this is not optional plumbing,
     it's the difference between the script working and crashing mid-run.
     """
+    return _invoke_with_retry(llm_with_tools, messages)
+
+
+def invoke_with_retry_no_tools(messages):
+    """Same retry/backoff, but against the no-tools model — used only for the
+    cap-recovery fallback in ask(), so the model can't request another tool
+    call it won't be allowed to make."""
+    return _invoke_with_retry(llm_no_tools, messages)
+
+
+def _invoke_with_retry(model, messages):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return llm_with_tools.invoke(messages)
+            return model.invoke(messages)
         except ChatGoogleGenerativeAIError as e:
             msg = str(e)
             is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
@@ -164,19 +194,35 @@ def ask(question: str):
     print(f"\n=== {question} ===")
     TOOL_CALL_LOG.clear()
     result = app.invoke({"messages": [("user", question)], "iterations": 0})
-    print(f"[final answer] {extract_text(result['messages'][-1].content)}")
+    last_message = result["messages"][-1]
+
+    # If the iteration cap was hit WHILE the model still wanted to call more
+    # tools, the last message has no real answer in it — just an unexecuted
+    # tool request. Rather than show the user a blank/empty response, force
+    # one more direct call asking the model to answer with whatever it has
+    # already gathered, tools disabled this time so it can't request another.
+    if getattr(last_message, "tool_calls", None):
+        print("[recovering from cap] Forcing a final answer from partial results...")
+        wrapup_prompt = SystemMessage(content=(
+            "You hit your tool-call limit before finishing. Answer the user's original "
+            "question now using ONLY the tool results already gathered in this conversation. "
+            "If some part genuinely can't be answered from what you have, say so plainly."
+        ))
+        messages = [SYSTEM_PROMPT, wrapup_prompt] + list(result["messages"])
+        final_response = invoke_with_retry_no_tools(messages)
+        print(f"[final answer] {extract_text(final_response.content)}")
+        return result
+
+    print(f"[final answer] {extract_text(last_message.content)}")
     return result
 
 
 if __name__ == "__main__":
-    # Target query from the plan — needs 4+ tool calls across cash and F&O data,
+    # Week 2 target query — needs 4+ tool calls across cash and F&O data,
     # with the model deciding the order itself
     ask("Is TCS's P/E higher than Infosys's, and is there unusual options activity "
         "building up in NIFTY this week?")
 
-    # Free-tier quotas are tight (as low as 5 req/min on some models) and the query
-    # above alone can burn most of it — pause here rather than immediately firing
-    # the next query into an already-exhausted quota.
     print("\n[pausing 20s to stay under free-tier rate limits]")
     time.sleep(20)
 
@@ -189,6 +235,15 @@ if __name__ == "__main__":
 
     # Simple case: should ideally resolve in one hop, good sanity check on iteration count
     ask("What is HDFC Bank's current stock price?")
+
+    print("\n[pausing 20s to stay under free-tier rate limits]")
+    time.sleep(20)
+
+    # Week 3 target query — needs BOTH search_filings AND search_regulations,
+    # the agent choosing correctly on its own across two DIFFERENT tool domains
+    # (document search vs. live market data), not just two live-data tools
+    ask("What did Reliance's Q3 concall say about Jio's subscriber growth, "
+        "and has SEBI changed F&O lot-size rules recently?")
 
     # Dump the log — this is the exact artifact week 5's eval scoring reuses
     with open("tool_call_log.jsonl", "w") as f:
