@@ -25,6 +25,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
 
 from langgraph_tools import ALL_TOOLS as MARKET_TOOLS
 
@@ -33,7 +34,10 @@ from langgraph_tools import ALL_TOOLS as MARKET_TOOLS
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rag"))
 from retrieval_tools import RAG_TOOLS
 
-ALL_TOOLS = MARKET_TOOLS + RAG_TOOLS
+# --- Week 4 Part 2: persisted watchlist tools ---
+from watchlist_tools import WATCHLIST_TOOLS
+
+ALL_TOOLS = MARKET_TOOLS + RAG_TOOLS + WATCHLIST_TOOLS
 
 MAX_ITERATIONS = 6  # safety cap — without this, a confused model can loop forever
                      # and burn your free-tier quota. Tune this up only if you hit
@@ -68,7 +72,9 @@ llm_no_tools = llm
 SYSTEM_PROMPT = SystemMessage(content=(
     "You are a research assistant for Indian cash equity and F&O markets. "
     "You have tools for live market data (prices, fundamentals, option chains, repo rate), "
-    "company filings/concall transcripts (search_filings), and SEBI regulations (search_regulations). "
+    "company filings/concall transcripts (search_filings), SEBI regulations (search_regulations), "
+    "and a persisted watchlist (add_to_watchlist, remove_from_watchlist, view_watchlist) that "
+    "survives across sessions. "
     "Use the tools available to you to answer with real data — don't guess numbers or quote "
     "regulations from memory. If no tool can answer part of a question, say so plainly instead "
     "of inventing data.\n\n"
@@ -76,7 +82,12 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "search with only minor rewording hoping for a better match. If the user asks about a specific "
     "period (e.g. 'Q3') but the available documents only cover a different period (e.g. 'Q1 FY27'), "
     "use the most recent available data and clearly tell the user which period it actually covers, "
-    "rather than searching repeatedly for an exact label match that may not exist in the corpus."
+    "rather than searching repeatedly for an exact label match that may not exist in the corpus.\n\n"
+    "When the user refers to 'my watchlist', 'the stocks I'm tracking', 'their margins/OI/etc.', "
+    "call view_watchlist FIRST to see what's actually tracked before answering — don't assume. "
+    "The watchlist mixes equities and F&O instruments; apply the right kind of follow-up to the "
+    "right kind of instrument (e.g. margin/OI questions to options, fundamentals/price to equities), "
+    "not the same treatment to everything."
 ))
 
 
@@ -114,12 +125,35 @@ def invoke_with_retry_no_tools(messages):
     return _invoke_with_retry(llm_no_tools, messages)
 
 
+class DailyQuotaExhausted(Exception):
+    """Raised when the API reports a per-day (not per-minute) quota is used up.
+    Unlike a per-minute rate limit, no amount of waiting within the same day
+    fixes this — retrying is actively counterproductive, so this is raised
+    immediately instead of going through the backoff loop."""
+    pass
+
+
 def _invoke_with_retry(model, messages):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return model.invoke(messages)
         except ChatGoogleGenerativeAIError as e:
             msg = str(e)
+
+            # A daily quota (RPD) exhaustion looks like a 429 too, but retrying
+            # within the same day cannot fix it — Google's daily quotas reset on
+            # a rolling ~24h basis, not on a per-minute backoff timescale. Fail
+            # fast with a clear message instead of burning retries and time.
+            if "PerDay" in msg or "RequestsPerDay" in msg:
+                raise DailyQuotaExhausted(
+                    "Daily request quota exhausted for this model on the free tier. "
+                    "This will NOT be fixed by waiting a few seconds — it resets on "
+                    "a ~24h cycle. Either wait, or switch MODEL below to one with a "
+                    "higher free-tier daily cap (e.g. gemini-2.5-flash or "
+                    "gemini-2.0-flash, both typically far more generous than "
+                    "gemini-3.5-flash's daily limit)."
+                ) from e
+
             is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
             if not is_rate_limit or attempt == MAX_RETRIES:
                 raise  # not a rate limit, or we're out of retries — let it surface
@@ -187,13 +221,33 @@ graph.set_entry_point("agent")
 graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
 graph.add_edge("tools", "agent")  # loop back — this is what makes it an agent, not a one-shot call
 
-app = graph.compile()
+# Week 4 Part 1: InMemorySaver gives the graph a conversation buffer — state
+# (the messages list) persists across multiple .invoke() calls as long as they
+# share the same thread_id. This is SESSION-only memory: it lives in RAM and
+# is gone the moment the script exits. Part 2 upgrades this to SqliteSaver,
+# which persists to disk and survives between separate script runs.
+checkpointer = InMemorySaver()
+app = graph.compile(checkpointer=checkpointer)
 
 
-def ask(question: str):
+def ask(question: str, thread_id: str = "default"):
+    """Ask a question within a conversation thread. Calling this multiple times
+    with the SAME thread_id lets the model see the full prior conversation —
+    that's the actual Week 4 Part 1 deliverable. Different thread_id = a totally
+    separate, unrelated conversation (useful for testing in isolation).
+
+    Note the explicit iterations=0 reset below: 'iterations' is a plain (non-
+    reducer) state field, so passing it in the input REPLACES the checkpointed
+    value rather than accumulating like 'messages' does. This is deliberate —
+    without it, the iteration cap would apply to the ENTIRE conversation's
+    total tool calls instead of resetting per turn, and a long conversation
+    would hit the cap after just a few turns even if each individual turn only
+    needed 1-2 tool calls.
+    """
     print(f"\n=== {question} ===")
     TOOL_CALL_LOG.clear()
-    result = app.invoke({"messages": [("user", question)], "iterations": 0})
+    config = {"configurable": {"thread_id": thread_id}}
+    result = app.invoke({"messages": [("user", question)], "iterations": 0}, config)
     last_message = result["messages"][-1]
 
     # If the iteration cap was hit WHILE the model still wanted to call more
@@ -217,35 +271,73 @@ def ask(question: str):
     return result
 
 
-if __name__ == "__main__":
-    # Week 2 target query — needs 4+ tool calls across cash and F&O data,
-    # with the model deciding the order itself
-    ask("Is TCS's P/E higher than Infosys's, and is there unusual options activity "
-        "building up in NIFTY this week?")
+def chat():
+    """Week 4 Part 1's actual deliverable: an interactive, multi-turn
+    conversation. Every question you type shares the same thread_id, so the
+    model can see everything said earlier in this session — try asking
+    something, then a follow-up using 'it'/'that'/'their' and see if it
+    resolves correctly using the conversation buffer.
 
-    print("\n[pausing 20s to stay under free-tier rate limits]")
-    time.sleep(20)
+    Type 'exit' or 'quit' to end. This is SESSION-only memory (Part 1) — once
+    you exit, the conversation is gone. Part 2 adds a persisted watchlist that
+    survives between runs.
+    """
+    thread_id = f"session-{int(time.time())}"
+    print("FinSight India — interactive mode. Type 'exit' or 'quit' to end.\n")
+    while True:
+        try:
+            question = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not question:
+            continue
+        if question.lower() in ("exit", "quit"):
+            break
+        try:
+            ask(question, thread_id=thread_id)
+        except DailyQuotaExhausted as e:
+            print(f"\n[STOPPED] {e}")
+            break
 
-    # Day 5: deliberately break it — no tool covers this, confirm graceful failure
-    # instead of hallucination
-    ask("What is the current crude oil price in USD per barrel?")
-
-    print("\n[pausing 20s to stay under free-tier rate limits]")
-    time.sleep(20)
-
-    # Simple case: should ideally resolve in one hop, good sanity check on iteration count
-    ask("What is HDFC Bank's current stock price?")
-
-    print("\n[pausing 20s to stay under free-tier rate limits]")
-    time.sleep(20)
-
-    # Week 3 target query — needs BOTH search_filings AND search_regulations,
-    # the agent choosing correctly on its own across two DIFFERENT tool domains
-    # (document search vs. live market data), not just two live-data tools
-    ask("What did Reliance's Q3 concall say about Jio's subscriber growth, "
-        "and has SEBI changed F&O lot-size rules recently?")
-
-    # Dump the log — this is the exact artifact week 5's eval scoring reuses
     with open("tool_call_log.jsonl", "w") as f:
         for entry in TOOL_CALL_LOG:
             f.write(json.dumps(entry) + "\n")
+
+
+def regression_test():
+    """The old scripted test sequence from weeks 2-3 — each question runs in
+    its OWN thread_id (see the thread_id= arg below), so they're deliberately
+    isolated from each other, unlike chat() where every question shares one
+    thread. Useful for confirming nothing regressed, but burns 4 queries'
+    worth of daily quota every run — prefer chat() for everyday testing."""
+    queries = [
+        "Is TCS's P/E higher than Infosys's, and is there unusual options activity "
+        "building up in NIFTY this week?",
+        "What is the current crude oil price in USD per barrel?",
+        "What is HDFC Bank's current stock price?",
+        "What did Reliance's Q3 concall say about Jio's subscriber growth, "
+        "and has SEBI changed F&O lot-size rules recently?",
+    ]
+
+    for i, question in enumerate(queries):
+        try:
+            ask(question, thread_id=f"regression-test-{i}")
+        except DailyQuotaExhausted as e:
+            print(f"\n[STOPPED] {e}")
+            print(f"[STOPPED] Completed {i}/{len(queries)} queries before hitting the daily cap.")
+            break
+
+        if i < len(queries) - 1:
+            print("\n[pausing 20s to stay under free-tier rate limits]")
+            time.sleep(20)
+
+    with open("tool_call_log.jsonl", "w") as f:
+        for entry in TOOL_CALL_LOG:
+            f.write(json.dumps(entry) + "\n")
+
+
+if __name__ == "__main__":
+    if "--regression-test" in sys.argv:
+        regression_test()
+    else:
+        chat()

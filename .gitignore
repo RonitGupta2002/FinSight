@@ -23,3 +23,5 @@ chroma_db/
 *_old.py
 
 tool_call_log.jsonl
+
+agent_loop/watchlist.db
