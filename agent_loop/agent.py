@@ -20,7 +20,7 @@ if sys.stdout.encoding.lower() != "utf-8":
 from dotenv import load_dotenv
 load_dotenv()  # reads the .env file in your project root into os.environ
 
-from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage
+from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage, HumanMessage, RemoveMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langgraph.graph import StateGraph, END
@@ -43,6 +43,13 @@ MAX_ITERATIONS = 6  # safety cap — without this, a confused model can loop for
                      # and burn your free-tier quota. Tune this up only if you hit
                      # it on a genuinely multi-hop query, not to paper over a bug.
 
+# Week 4 Part 3: summarization thresholds. A single turn with several tool
+# calls can easily be 6-10 messages on its own (human question, tool-call
+# request, one ToolMessage per call, final answer) — these numbers are set
+# generously with that in mind, not tuned for simple one-shot Q&A.
+SUMMARY_TRIGGER_MESSAGES = 20  # summarize once the buffer exceeds this many messages
+KEEP_RECENT_MESSAGES = 10       # always keep this many of the MOST RECENT messages verbatim
+
 MAX_RETRIES = 4          # how many times to retry a rate-limited call before giving up
 DEFAULT_BACKOFF = 15     # seconds to wait if the API doesn't tell us how long to wait
 
@@ -56,6 +63,7 @@ TOOL_CALL_LOG = []
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     iterations: int
+    summary: str  # Week 4 Part 3: running summary of older, trimmed-away messages
 
 
 llm = ChatGoogleGenerativeAI(
@@ -168,7 +176,14 @@ def _invoke_with_retry(model, messages):
 
 def call_agent(state: AgentState) -> dict:
     """The 'reason' step — the model decides what to do next given the conversation so far."""
-    messages = [SYSTEM_PROMPT] + list(state["messages"])
+    messages = [SYSTEM_PROMPT]
+    summary = state.get("summary", "")
+    if summary:
+        # The running summary stands in for messages that have been trimmed
+        # away (see summarize_if_needed) — without this, trimming would mean
+        # genuinely forgetting things, not just compressing them.
+        messages.append(SystemMessage(content=f"Summary of earlier conversation:\n{summary}"))
+    messages += list(state["messages"])
     response = invoke_with_retry(messages)
     return {"messages": [response], "iterations": state.get("iterations", 0) + 1}
 
@@ -230,6 +245,57 @@ checkpointer = InMemorySaver()
 app = graph.compile(checkpointer=checkpointer)
 
 
+def summarize_if_needed(thread_id: str):
+    """Week 4 Part 3: check this thread's message count, and if it's over the
+    threshold, compress everything except the most recent messages into a
+    running summary. Call this after a turn completes (see ask() below) —
+    not mid-turn, since trimming messages while the agent is still reasoning
+    about the current question could remove something it's actively using.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    state = app.get_state(config).values
+    messages = state.get("messages", [])
+
+    if len(messages) <= SUMMARY_TRIGGER_MESSAGES:
+        return  # nothing to do yet
+
+    to_summarize = messages[:-KEEP_RECENT_MESSAGES]
+    to_keep = messages[-KEEP_RECENT_MESSAGES:]
+    existing_summary = state.get("summary", "")
+
+    # Build the summarization prompt — explicitly ask the model to preserve
+    # concrete facts (tickers, figures, watchlist items) since THOSE are what
+    # follow-up questions actually need, not a vague narrative recap.
+    convo_text = "\n".join(
+        f"{m.__class__.__name__}: {extract_text(m.content)}"
+        for m in to_summarize if hasattr(m, "content")
+    )
+    prompt = (
+        "Summarize the following conversation excerpt concisely, but preserve every "
+        "concrete fact that a follow-up question might need: specific tickers, prices, "
+        "ratios, dates, watchlist items, and any figures mentioned. Do not editorialize "
+        "or add commentary — just compress.\n\n"
+    )
+    if existing_summary:
+        prompt += f"Existing summary of even earlier context:\n{existing_summary}\n\n"
+    prompt += f"Conversation to fold into the summary:\n{convo_text}"
+
+    print(f"[summarizing] {len(to_summarize)} older messages -> compressed summary "
+          f"(keeping last {len(to_keep)} messages verbatim)")
+    # Sent as a HumanMessage, not a SystemMessage — Gemini's API requires actual
+    # conversation content ('contents') separately from system instructions,
+    # and a request containing ONLY a system message has no contents at all,
+    # which errors with "contents are required". A HumanMessage always counts
+    # as real content.
+    response = invoke_with_retry_no_tools([HumanMessage(content=prompt)])
+    new_summary = extract_text(response.content)
+
+    # RemoveMessage actually deletes these from the checkpointed state — this
+    # is real trimming, not just hiding them from one LLM call.
+    remove_ops = [RemoveMessage(id=m.id) for m in to_summarize if hasattr(m, "id") and m.id]
+    app.update_state(config, {"messages": remove_ops, "summary": new_summary})
+
+
 def ask(question: str, thread_id: str = "default"):
     """Ask a question within a conversation thread. Calling this multiple times
     with the SAME thread_id lets the model see the full prior conversation —
@@ -265,9 +331,11 @@ def ask(question: str, thread_id: str = "default"):
         messages = [SYSTEM_PROMPT, wrapup_prompt] + list(result["messages"])
         final_response = invoke_with_retry_no_tools(messages)
         print(f"[final answer] {extract_text(final_response.content)}")
+        summarize_if_needed(thread_id)
         return result
 
     print(f"[final answer] {extract_text(last_message.content)}")
+    summarize_if_needed(thread_id)
     return result
 
 
@@ -336,8 +404,60 @@ def regression_test():
             f.write(json.dumps(entry) + "\n")
 
 
+def stress_test():
+    """Week 4 Part 3's Day 6-7 deliverable: a 15+ turn conversation, all in ONE
+    thread, deliberately mixing equity and F&O references so later turns must
+    correctly resolve pronouns/references against a summarized (not fully raw)
+    history — this only becomes a real test once summarization has actually
+    kicked in partway through, not before.
+
+    WARNING ON QUOTA: 15 turns, several of which need multiple tool calls, can
+    easily approach or exceed a 20-req/day free-tier cap in ONE run. If you hit
+    DailyQuotaExhausted partway through, that's expected — note which turn
+    number it stopped at and resume the rest tomorrow, or switch to a model
+    with a higher daily cap (see MODEL near the top of this file) before
+    re-running the whole thing in one sitting.
+    """
+    thread_id = f"stress-test-{int(time.time())}"
+    turns = [
+        "Track HDFC Bank, ICICI Bank, and NIFTY weekly options",                         # 1
+        "What is HDFC Bank's P/E ratio?",                                                  # 2
+        "How does that compare to ICICI Bank?",                                            # 3
+        # "What is the current NIFTY underlying value?",                                     # 4
+        "Is there heavy put writing at any strike near that level?",                       # 5
+        "What is TCS's current stock price?",                                              # 6
+        # "Add TCS to my watchlist as well",                                                 # 7
+        # "What is Infosys's P/E ratio?",                                                    # 8
+        # "Which of TCS and Infosys is cheaper on a P/E basis?",                             # 9
+        # "What did Reliance's latest filing say about Jio's subscriber numbers?",           # 10
+        # "Has SEBI made any recent changes to F&O margin rules?",                          # 11
+        # "What's on my watchlist right now?",                                              # 12
+        "How are the two bank stocks on my watchlist doing on valuation?",                 # 13
+        "And how does the options instrument on my watchlist look for OI trends?",         # 14
+        "Summarize everything we've discussed about my watchlist in this conversation.",   # 15
+    ]
+
+    for i, question in enumerate(turns, start=1):
+        try:
+            ask(question, thread_id=thread_id)
+        except DailyQuotaExhausted as e:
+            print(f"\n[STOPPED] {e}")
+            print(f"[STOPPED] Completed {i - 1}/{len(turns)} turns before hitting the daily cap.")
+            break
+
+        if i < len(turns):
+            print(f"\n[turn {i}/{len(turns)} done, pausing 20s to stay under free-tier rate limits]")
+            time.sleep(20)
+
+    with open("tool_call_log.jsonl", "w") as f:
+        for entry in TOOL_CALL_LOG:
+            f.write(json.dumps(entry) + "\n")
+
+
 if __name__ == "__main__":
     if "--regression-test" in sys.argv:
         regression_test()
+    elif "--stress-test" in sys.argv:
+        stress_test()
     else:
         chat()
