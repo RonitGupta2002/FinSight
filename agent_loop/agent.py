@@ -10,6 +10,7 @@ import os
 import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Annotated, Sequence, TypedDict
 
 # Windows terminals default to cp1252, which can't print ₹ or other non-ASCII
@@ -66,16 +67,102 @@ class AgentState(TypedDict):
     summary: str  # Week 4 Part 3: running summary of older, trimmed-away messages
 
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
-    temperature=0,
-    api_key=os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"),
-)
-llm_with_tools = llm.bind_tools(ALL_TOOLS)
+MODEL = "gemini-3.5-flash"  # gemini-2.5-flash failed (not available on this account/key —
+                             # confirmed via list_models.py / direct testing), so back to
+                             # gemini-3.5-flash despite its lower 20/day quota. Key rotation
+                             # (QUESTIONS_PER_KEY below) is what actually compensates for that
+                             # now, not the model choice.
+
+# Week 5: automatic key rotation. Built from whatever numbered keys actually
+# exist in .env (GEMINI_API_KEY1, GEMINI_API_KEY2, GEMINI_API_KEY3, ...) —
+# add a third key later and it's picked up automatically, no code change.
+# Falls back to the old single-key names if no numbered keys are set at all,
+# so weeks 1-4's .env setup still works untouched.
+QUESTIONS_PER_KEY = 8  # proactively rotate BEFORE hitting the daily wall, not after —
+                        # matches the batch size these eval runs are already sized for.
+
+CALL_LOG_PATH = os.path.join(os.path.dirname(__file__), "api_call_log.jsonl")
+
+
+def _discover_key_pool() -> list[str]:
+    """Find every GEMINI_API_KEYn defined in .env, in order. Falls back to
+    the older single-key names if none of the numbered ones are set."""
+    pool = []
+    i = 1
+    while os.environ.get(f"GEMINI_API_KEY{i}"):
+        pool.append(f"GEMINI_API_KEY{i}")
+        i += 1
+    if pool:
+        return pool
+    fallback = "GOOGLE_API_KEY" if os.environ.get("GOOGLE_API_KEY") else "GEMINI_API_KEY"
+    if os.environ.get(fallback):
+        return [fallback]
+    raise RuntimeError(
+        "No API key found. Set GEMINI_API_KEY1 (and optionally GEMINI_API_KEY2, "
+        "GEMINI_API_KEY3, ...) in your .env file, or GOOGLE_API_KEY / GEMINI_API_KEY "
+        "for the older single-key setup."
+    )
+
+
+KEY_POOL = _discover_key_pool()
+_key_index = 0                # which key in KEY_POOL is currently active
+_questions_on_current_key = 0  # how many ask() calls have used it so far
+
+
+def _log_call(purpose: str, key_alias: str, success: bool, error: str = None):
+    """Append one line per actual API call — every call, not just failures.
+    This is the raw material for week 5's eval scoring: cost/latency tracking
+    and tool-call correctness both want to know exactly what was called, when,
+    with which key, and whether it succeeded."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "purpose": purpose,          # "agent" | "no_tools" | "summarize"
+        "key_alias": key_alias,
+        "success": success,
+        "error": error,
+    }
+    with open(CALL_LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _build_llm():
+    """(Re)build the LLM clients bound to whichever key is currently active.
+    Called once at startup and again every time _rotate_key() switches keys —
+    langchain_google_genai binds an api_key at construction time, so a real
+    key swap means constructing a new client, not just changing a variable."""
+    global llm, llm_with_tools, llm_no_tools
+    active_key_name = KEY_POOL[_key_index]
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL,
+        temperature=0,
+        api_key=os.environ[active_key_name],
+    )
+    llm_with_tools = llm.bind_tools(ALL_TOOLS)
+    llm_no_tools = llm
+
+
+def _rotate_key():
+    """Move to the next key in the pool and rebuild the LLM clients. Raises
+    once every key in the pool has been used up for this run — at that point
+    waiting for tomorrow (or adding another GEMINI_API_KEYn) is the only option."""
+    global _key_index, _questions_on_current_key
+    if _key_index + 1 >= len(KEY_POOL):
+        raise RuntimeError(
+            f"All {len(KEY_POOL)} configured API key(s) have each handled "
+            f"{QUESTIONS_PER_KEY} questions this run. Add another GEMINI_API_KEYn "
+            f"to .env, or wait for a key's daily quota to reset."
+        )
+    _key_index += 1
+    _questions_on_current_key = 0
+    print(f"[key rotation] Switching to {KEY_POOL[_key_index]} after "
+          f"{QUESTIONS_PER_KEY} questions on the previous key.")
+    _build_llm()
+
+
+_build_llm()  # initial construction, using KEY_POOL[0]
 # Same model, no tools bound — used only as a last resort when the iteration
 # cap is hit mid-tool-call, so the model is forced to produce a text answer
 # instead of requesting yet another tool call it won't be allowed to make.
-llm_no_tools = llm
 
 SYSTEM_PROMPT = SystemMessage(content=(
     "You are a research assistant for Indian cash equity and F&O markets. "
@@ -92,7 +179,11 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "use the most recent available data and clearly tell the user which period it actually covers, "
     "rather than searching repeatedly for an exact label match that may not exist in the corpus.\n\n"
     "When the user refers to 'my watchlist', 'the stocks I'm tracking', 'their margins/OI/etc.', "
-    "call view_watchlist FIRST to see what's actually tracked before answering — don't assume. "
+    "OR asks you to summarize/recap the conversation, call view_watchlist FIRST to see what's "
+    "ACTUALLY tracked before answering — don't assume, and don't rely on conversation memory alone. "
+    "A stock being discussed or looked up earlier in the conversation does NOT mean it was added to "
+    "the watchlist — only add_to_watchlist actually tracks something. Never state that an instrument "
+    "is 'on the watchlist' unless view_watchlist actually confirms it. "
     "The watchlist mixes equities and F&O instruments; apply the right kind of follow-up to the "
     "right kind of instrument (e.g. margin/OI questions to options, fundamentals/price to equities), "
     "not the same treatment to everything."
@@ -123,28 +214,34 @@ def invoke_with_retry(messages):
     a multi-hop query alone can exhaust it, so this is not optional plumbing,
     it's the difference between the script working and crashing mid-run.
     """
-    return _invoke_with_retry(llm_with_tools, messages)
+    return _invoke_with_retry(llm_with_tools, messages, purpose="agent")
 
 
 def invoke_with_retry_no_tools(messages):
     """Same retry/backoff, but against the no-tools model — used only for the
     cap-recovery fallback in ask(), so the model can't request another tool
     call it won't be allowed to make."""
-    return _invoke_with_retry(llm_no_tools, messages)
+    return _invoke_with_retry(llm_no_tools, messages, purpose="no_tools")
 
 
 class DailyQuotaExhausted(Exception):
     """Raised when the API reports a per-day (not per-minute) quota is used up.
     Unlike a per-minute rate limit, no amount of waiting within the same day
     fixes this — retrying is actively counterproductive, so this is raised
-    immediately instead of going through the backoff loop."""
+    immediately instead of going through the backoff loop. With proactive
+    rotation (QUESTIONS_PER_KEY) this should be rare in practice — it's the
+    safety net for when a key was already partially used before this run
+    started, not the primary rotation mechanism."""
     pass
 
 
-def _invoke_with_retry(model, messages):
+def _invoke_with_retry(model, messages, purpose: str = "agent"):
+    key_alias = KEY_POOL[_key_index]
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return model.invoke(messages)
+            response = model.invoke(messages)
+            _log_call(purpose, key_alias, success=True)
+            return response
         except ChatGoogleGenerativeAIError as e:
             msg = str(e)
 
@@ -153,17 +250,18 @@ def _invoke_with_retry(model, messages):
             # a rolling ~24h basis, not on a per-minute backoff timescale. Fail
             # fast with a clear message instead of burning retries and time.
             if "PerDay" in msg or "RequestsPerDay" in msg:
+                _log_call(purpose, key_alias, success=False, error="daily_quota_exhausted")
                 raise DailyQuotaExhausted(
-                    "Daily request quota exhausted for this model on the free tier. "
+                    f"Daily request quota exhausted for '{MODEL}' on key '{key_alias}'. "
                     "This will NOT be fixed by waiting a few seconds — it resets on "
-                    "a ~24h cycle. Either wait, or switch MODEL below to one with a "
-                    "higher free-tier daily cap (e.g. gemini-2.5-flash or "
-                    "gemini-2.0-flash, both typically far more generous than "
-                    "gemini-3.5-flash's daily limit)."
+                    "a ~24h cycle. Either wait, or add another GEMINI_API_KEYn to .env "
+                    "so rotation has somewhere to go next run — check current quota "
+                    "numbers at https://ai.google.dev/gemini-api/docs/rate-limits."
                 ) from e
 
             is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
             if not is_rate_limit or attempt == MAX_RETRIES:
+                _log_call(purpose, key_alias, success=False, error=msg[:200])
                 raise  # not a rate limit, or we're out of retries — let it surface
 
             # The API often tells us exactly how long to wait — use that if present,
@@ -309,8 +407,20 @@ def ask(question: str, thread_id: str = "default"):
     total tool calls instead of resetting per turn, and a long conversation
     would hit the cap after just a few turns even if each individual turn only
     needed 1-2 tool calls.
+
+    Week 5: also handles automatic key rotation — every call increments a
+    per-key question counter, and rotates to the next configured key BEFORE
+    the QUESTIONS_PER_KEY limit is exceeded, rather than waiting for an
+    actual quota error.
     """
     print(f"\n=== {question} ===")
+    global _questions_on_current_key
+    _questions_on_current_key += 1
+    if _questions_on_current_key > QUESTIONS_PER_KEY:
+        _rotate_key()
+        _questions_on_current_key = 1  # this question is the first on the new key
+    print(f"[key] using {KEY_POOL[_key_index]} (question {_questions_on_current_key}/{QUESTIONS_PER_KEY} on this key)")
+
     TOOL_CALL_LOG.clear()
     config = {"configurable": {"thread_id": thread_id}}
     result = app.invoke({"messages": [("user", question)], "iterations": 0}, config)
