@@ -21,7 +21,7 @@ if sys.stdout.encoding.lower() != "utf-8":
 from dotenv import load_dotenv
 load_dotenv()  # reads the .env file in your project root into os.environ
 
-from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import BaseMessage, ToolMessage, SystemMessage, HumanMessage, RemoveMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langgraph.graph import StateGraph, END
@@ -206,6 +206,55 @@ def extract_text(content) -> str:
                 parts.append(block)
         return "\n".join(parts) if parts else str(content)
     return str(content)
+
+def _build_tool_log_digest(tool_log, max_snippets=8, max_chars_per_snippet=300, max_total_chars=3000):
+    """Round 4: guarantee every distinct tool call contributes at least one
+    snippet before spending remaining budget on the highest-relevance
+    leftovers. Round 3 fixed losing data to raw truncation, but a single
+    search call returning several individually-scored sub-results could
+    still crowd out every OTHER tool call's data entirely (confirmed live
+    on multi_05: one 5-result search_filings call filled 5 of 6 digest
+    slots, dropping option-chain and calculate results that were also
+    needed)."""
+    per_call_best = []
+    leftover_candidates = []
+    for entry in tool_log:
+        raw = entry.get("result", "")
+        tool_name = entry.get("tool", "?")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            parsed = None
+        call_candidates = []
+        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+            for item in parsed["results"]:
+                text = item.get("text", "")
+                score = item.get("relevance_score", 0)
+                if text:
+                    call_candidates.append((score, text[:max_chars_per_snippet], tool_name))
+        else:
+            snippet = str(raw)[:max_chars_per_snippet]
+            call_candidates.append((0, snippet, tool_name))
+        if not call_candidates:
+            continue
+        call_candidates.sort(key=lambda c: c[0], reverse=True)
+        per_call_best.append(call_candidates[0])        # guaranteed slot per call
+        leftover_candidates.extend(call_candidates[1:])  # rest compete for remaining budget
+
+    leftover_candidates.sort(key=lambda c: c[0], reverse=True)
+    ordered = per_call_best + leftover_candidates
+
+    parts, total, count = [], 0, 0
+    for score, text, tool_name in ordered:
+        if count >= max_snippets:
+            break
+        piece = f"[{tool_name}] {text}"
+        if total + len(piece) > max_total_chars:
+            continue
+        parts.append(piece)
+        total += len(piece)
+        count += 1
+    return "\n\n".join(parts)
 
 
 def invoke_with_retry(messages):
@@ -436,12 +485,55 @@ def ask(question: str, thread_id: str = "default"):
         wrapup_prompt = SystemMessage(content=(
             "You hit your tool-call limit before finishing. Answer the user's original "
             "question now using ONLY the tool results already gathered in this conversation. "
-            "If some part genuinely can't be answered from what you have, say so plainly."
+            "You must respond with plain text and must not attempt to call any tool. "
+            "If some part genuinely can't be answered from what you have, say so plainly, "
+            "but you must still produce a real text answer — never an empty response."
         ))
         messages = [SYSTEM_PROMPT, wrapup_prompt] + list(result["messages"])
         final_response = invoke_with_retry_no_tools(messages)
-        print(f"[final answer] {extract_text(final_response.content)}")
+        answer_text = extract_text(final_response.content)
+
+        # Observed failure mode (fund_05, filing_04 eval runs): the wrap-up call
+        # itself can come back with zero content blocks, which extract_text()
+        # renders as the literal string "[]". Fall back to a deterministic,
+        # honest message built from the raw tool log instead of showing nothing.
+        if not answer_text.strip() or answer_text.strip() == "[]":
+            # First synthesis attempt came back empty. Before giving up, try
+            # once more with a short, directive prompt built from just the
+            # raw tool results already gathered — both fund_05 and
+            # filing_04/filing_05 had the real answer sitting in
+            # TOOL_CALL_LOG at this exact point; the original wrap-up call
+            # just never surfaced it.
+            digest = _build_tool_log_digest(TOOL_CALL_LOG)
+            if digest:
+                print("[recovering from cap] First synthesis was empty — "
+                      "retrying with a compact fact digest...")
+                digest_prompt = HumanMessage(content=(
+                    f"Below are raw results from tools already called while answering: "
+                    f"\"{question}\"\n\n{digest}\n\n"
+                    "State only the concrete facts above that answer the question, in "
+                    "2-3 plain sentences. If nothing above answers it, say so in one sentence."
+                ))
+                retry_response = invoke_with_retry_no_tools([digest_prompt])
+                retry_text = extract_text(retry_response.content)
+                if retry_text.strip() and retry_text.strip() != "[]":
+                    answer_text = retry_text
+
+        if not answer_text.strip() or answer_text.strip() == "[]":
+            tools_tried = ", ".join(sorted({c["tool"] for c in TOOL_CALL_LOG})) or "no tools"
+            answer_text = (
+                "I gathered some information but hit my reasoning-step limit before "
+                f"finishing, and my summary attempts came back empty. Tools I tried: "
+                f"{tools_tried}. Please try asking again, ideally about one part of the "
+                "question at a time."
+            )
+
+        print(f"[final answer] {answer_text}")
+
+        recovered_message = AIMessage(content=answer_text)
+        app.update_state(config, {"messages": [recovered_message]})
         summarize_if_needed(thread_id)
+        result["messages"] = list(result["messages"]) + [recovered_message]
         return result
 
     print(f"[final answer] {extract_text(last_message.content)}")
