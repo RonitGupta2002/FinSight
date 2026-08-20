@@ -215,7 +215,15 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "unrelated company just because the name is similar. Either state the "
     "ambiguity plainly and ask which entity they mean, or clearly state "
     "which one you're assuming and why — never substitute an entity you "
-    "haven't verified is actually the same business."
+    "haven't verified is actually the same business.\n\n"
+    "Week 6 — citations are mandatory, not optional style: any claim drawn from "
+    "search_filings or search_regulations MUST be attributed inline, e.g. "
+    "'(Source: Reliance Industries, Q1_FY27_results.pdf)' for a filing or "
+    "'(Source: SEBI circular, <filename>)' for a regulation — name the actual "
+    "company/source returned by the tool, never a generic 'the filing' or 'SEBI says'. "
+    "If search_filings or search_regulations returns no relevant results, say plainly "
+    "that no matching filing/regulation was found for that part of the question — "
+    "do not answer it from memory or general knowledge instead."
 ))
 
 
@@ -284,6 +292,144 @@ def _build_tool_log_digest(tool_log, max_snippets=8, max_chars_per_snippet=300, 
         total += len(piece)
         count += 1
     return "\n\n".join(parts)
+
+
+RAG_TOOL_NAMES = {"search_filings", "search_regulations"}
+
+# Loose but auditable phrases that count as "the answer admits it found
+# nothing" — used only to gate whether a repair pass is needed, not shown
+# to the user, so false negatives here just mean an unnecessary repair call
+# rather than a wrong answer slipping through.
+NO_DATA_PHRASES = (
+    "no relevant", "couldn't find", "could not find", "no matching",
+    "not available", "no results", "unable to find", "don't have",
+    "do not have", "no data", "nothing relevant", "no filings",
+    "no regulations", "no circular", "wasn't able to find", "was not able to find",
+)
+
+
+def _rag_calls_this_turn(tool_log):
+    """Inspect this turn's TOOL_CALL_LOG for search_filings/search_regulations
+    calls and classify what actually happened, so citation enforcement can be
+    checked against ground truth instead of assumed from the prompt alone.
+
+    Returns:
+        rag_called: any RAG tool was called this turn at all
+        rag_succeeded: at least one RAG call returned real results
+        sources: [{"source": ..., "company": ...}, ...] actually retrieved
+        errored_only: every RAG call this turn came back empty/errored
+    """
+    rag_entries = [e for e in tool_log if e.get("tool") in RAG_TOOL_NAMES]
+    if not rag_entries:
+        return False, False, [], False
+
+    sources = []
+    any_succeeded = False
+    any_errored = False
+    for entry in rag_entries:
+        raw = entry.get("result", "")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list) and parsed["results"]:
+            any_succeeded = True
+            for item in parsed["results"]:
+                src = item.get("source")
+                if src:
+                    sources.append({"source": src, "company": item.get("company")})
+        else:
+            any_errored = True
+
+    return True, any_succeeded, sources, (any_errored and not any_succeeded)
+
+
+def _answer_cites_sources(answer_text: str, sources: list) -> bool:
+    """A citation counts only if the answer names the actual retrieved SOURCE
+    FILE (or a recognizable chunk of its filename) — not merely the company
+    name. Company-name-only mentions ('According to Reliance's filing...')
+    are exactly the failure mode this check exists to catch: they read as
+    attributed but can't actually be traced back to a specific document.
+    Loose on formatting (doesn't require an exact '(Source: ...)' string),
+    strict on substance (the real filename must appear somewhere)."""
+    if not sources:
+        return True  # nothing was retrieved, so nothing to cite
+    text_lower = answer_text.lower()
+    for s in sources:
+        src = (s.get("source") or "").lower()
+        if not src:
+            continue
+        stem = os.path.splitext(src)[0]
+        # Require the full filename, or a substantial (>=15 char) chunk of its
+        # stem — long enough that it can't be satisfied by coincidence or by
+        # a generic phrase, short enough to tolerate the model truncating a
+        # very long filename when it quotes it.
+        if src in text_lower or (len(stem) >= 15 and stem[:40].lower() in text_lower):
+            return True
+    return False
+
+
+def _answer_acknowledges_no_data(answer_text: str) -> bool:
+    text_lower = answer_text.lower()
+    return any(phrase in text_lower for phrase in NO_DATA_PHRASES)
+
+
+def enforce_citations_and_refusals(question: str, answer_text: str, thread_id: str) -> str:
+    """Week 6, Part 1: the verification layer behind the system prompt's
+    citation/refusal instructions. Two checks, run against what TOOL_CALL_LOG
+    actually shows happened this turn — not against what the model claims:
+
+    (a) If every filings/regulations search this turn came back empty, the
+        answer must say so plainly, not quietly answer from general knowledge.
+    (b) If filings/regulations WERE retrieved and used, the answer must name
+        the actual source — an unattributed claim next to a successful RAG
+        call is exactly the failure mode citation enforcement exists to catch.
+
+    Both repairs reuse the same pattern as the cap-recovery fallback earlier
+    in this file: one extra no-tools call, given the draft answer and the
+    concrete facts needed, asked to fix ONLY the specific problem rather than
+    rewrite the whole thing. If the repair call itself comes back empty, the
+    original answer is kept rather than replaced with nothing.
+    """
+    rag_called, rag_succeeded, sources, errored_only = _rag_calls_this_turn(TOOL_CALL_LOG)
+    if not rag_called:
+        return answer_text
+
+    if errored_only:
+        if _answer_acknowledges_no_data(answer_text):
+            return answer_text
+        print("[citation enforcement] RAG search(es) returned nothing, but the "
+              "draft answer doesn't acknowledge that — requesting a corrected answer...")
+        fix_prompt = HumanMessage(content=(
+            f"Your draft answer to \"{question}\" was:\n\n{answer_text}\n\n"
+            "Every filings/regulations search you ran this turn came back with no "
+            "relevant results. Rewrite the answer to clearly state that no matching "
+            "filing or regulation was found for that part of the question, instead "
+            "of asserting facts about it from memory. Keep any parts genuinely "
+            "answered by other tools (live prices, fundamentals, option data) unchanged."
+        ))
+        response = invoke_with_retry_no_tools([fix_prompt])
+        fixed = extract_text(response.content)
+        return fixed if fixed.strip() and fixed.strip() != "[]" else answer_text
+
+    if rag_succeeded and not _answer_cites_sources(answer_text, sources):
+        print("[citation enforcement] RAG results were used but no source is "
+              "named in the draft answer — requesting a corrected, cited answer...")
+        source_list = "\n".join(
+            f"- {s.get('company') or 'SEBI regulation'}: {s.get('source')}" for s in sources
+        )
+        fix_prompt = HumanMessage(content=(
+            f"Your draft answer to \"{question}\" was:\n\n{answer_text}\n\n"
+            f"That answer used information retrieved from these sources:\n{source_list}\n\n"
+            "Rewrite the answer so every claim drawn from a filing or regulation names "
+            "its actual source inline, e.g. '(Source: <company or regulation>, <file>)'. "
+            "This is a citation fix only — keep the content and conclusions the same."
+        ))
+        response = invoke_with_retry_no_tools([fix_prompt])
+        fixed = extract_text(response.content)
+        return fixed if fixed.strip() and fixed.strip() != "[]" else answer_text
+
+    return answer_text
 
 
 def invoke_with_retry(messages):
@@ -567,6 +713,8 @@ def _ask_impl(question: str, thread_id: str = "default"):
                 "question at a time."
             )
 
+        answer_text = enforce_citations_and_refusals(question, answer_text, thread_id)
+
         print(f"[final answer] {answer_text}")
 
         recovered_message = AIMessage(content=answer_text)
@@ -575,7 +723,15 @@ def _ask_impl(question: str, thread_id: str = "default"):
         result["messages"] = list(result["messages"]) + [recovered_message]
         return result
 
-    print(f"[final answer] {extract_text(last_message.content)}")
+    answer_text = extract_text(last_message.content)
+    fixed_text = enforce_citations_and_refusals(question, answer_text, thread_id)
+    if fixed_text != answer_text:
+        fixed_message = AIMessage(content=fixed_text)
+        app.update_state(config, {"messages": [fixed_message]})
+        result["messages"] = list(result["messages"]) + [fixed_message]
+        answer_text = fixed_text
+
+    print(f"[final answer] {answer_text}")
     summarize_if_needed(thread_id)
     return result
 
