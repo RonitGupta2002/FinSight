@@ -103,10 +103,30 @@ def _discover_key_pool() -> list[str]:
         "for the older single-key setup."
     )
 
+KEY_STATE_PATH = os.path.join(os.path.dirname(__file__), ".key_rotation_state.json")
+
+def _load_key_state():
+    if os.path.exists(KEY_STATE_PATH):
+        try:
+            with open(KEY_STATE_PATH) as f:
+                state = json.load(f)
+            idx = state.get("key_index", 0)
+            if idx < len(KEY_POOL):  # pool may have changed since last run
+                return idx, state.get("questions_on_current_key", 0)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return 0, 0
+
+def _save_key_state():
+    try:
+        with open(KEY_STATE_PATH, "w") as f:
+            json.dump({"key_index": _key_index,
+                       "questions_on_current_key": _questions_on_current_key}, f)
+    except OSError:
+        pass  # non-fatal — worst case, next run starts from key 0, same as before this patch
 
 KEY_POOL = _discover_key_pool()
-_key_index = 0                # which key in KEY_POOL is currently active
-_questions_on_current_key = 0  # how many ask() calls have used it so far
+_key_index, _questions_on_current_key = _load_key_state()
 
 
 def _log_call(purpose: str, key_alias: str, success: bool, error: str = None):
@@ -173,8 +193,10 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "Use the tools available to you to answer with real data — don't guess numbers or quote "
     "regulations from memory. If no tool can answer part of a question, say so plainly instead "
     "of inventing data.\n\n"
-    "Important: if a search tool returns relevant results, use them — do not repeat the same "
-    "search with only minor rewording hoping for a better match. If the user asks about a specific "
+    "Important: if a search tool returns relevant results that directly answer the question, "
+    "STOP searching and answer immediately — do not repeat the search with reworded queries to "
+    "double-check or look for more detail, even once. Each additional search costs you a "
+    "reasoning step you may need later in the question. If the user asks about a specific "
     "period (e.g. 'Q3') but the available documents only cover a different period (e.g. 'Q1 FY27'), "
     "use the most recent available data and clearly tell the user which period it actually covers, "
     "rather than searching repeatedly for an exact label match that may not exist in the corpus.\n\n"
@@ -187,6 +209,13 @@ SYSTEM_PROMPT = SystemMessage(content=(
     "The watchlist mixes equities and F&O instruments; apply the right kind of follow-up to the "
     "right kind of instrument (e.g. margin/OI questions to options, fundamentals/price to equities), "
     "not the same treatment to everything."
+    "If a ticker or company lookup fails and you're unsure which specific "
+    "entity the user means (e.g. a company with multiple listed entities "
+    "after a demerger or restructuring), do NOT guess a DIFFERENT, "
+    "unrelated company just because the name is similar. Either state the "
+    "ambiguity plainly and ask which entity they mean, or clearly state "
+    "which one you're assuming and why — never substitute an entity you "
+    "haven't verified is actually the same business."
 ))
 
 
@@ -442,8 +471,18 @@ def summarize_if_needed(thread_id: str):
     remove_ops = [RemoveMessage(id=m.id) for m in to_summarize if hasattr(m, "id") and m.id]
     app.update_state(config, {"messages": remove_ops, "summary": new_summary})
 
-
 def ask(question: str, thread_id: str = "default"):
+    """Thin wrapper adding reactive key rotation on top of _ask_impl."""
+    try:
+        return _ask_impl(question, thread_id)
+    except DailyQuotaExhausted:
+        if _key_index + 1 < len(KEY_POOL):
+            print("[reactive rotation] Key exhausted mid-question — rotating and retrying once...")
+            _rotate_key()
+            return _ask_impl(question, thread_id)
+        raise
+
+def _ask_impl(question: str, thread_id: str = "default"):
     """Ask a question within a conversation thread. Calling this multiple times
     with the SAME thread_id lets the model see the full prior conversation —
     that's the actual Week 4 Part 1 deliverable. Different thread_id = a totally
