@@ -1,12 +1,3 @@
-"""
-FinSight India — Week 4, Part 2: persisted watchlist.
-
-Plain SQLite functions, no LangChain here — same separation as week 3's
-retrieval.py (logic) vs retrieval_tools.py (tool wrapping). This file's only
-job is CRUD against a local .db file that survives between script runs,
-unlike Part 1's InMemorySaver conversation memory which resets every session.
-"""
-
 import sqlite3
 import os
 from datetime import datetime, timezone

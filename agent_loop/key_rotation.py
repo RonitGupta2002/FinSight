@@ -1,16 +1,3 @@
-"""
-Zero-cost test for Item 4 (key rotation persistence + reactive rotation).
-
-No real Gemini calls happen in this script. Test 3/4 replace agent._ask_impl
-with a fake function, so agent.ask()'s wrapper logic is tested in isolation
-from the real prompt/tool-call logic inside _ask_impl. Test 1/2 test only
-the file-persistence functions directly. Constructing an LLM client during
-_rotate_key() (via _build_llm()) does not itself make a network call, so
-this stays zero-cost even though it needs a valid-looking key in .env.
-
-Run from agent_loop/:
-    python test_key_rotation.py
-"""
 import os
 import sys
 import json

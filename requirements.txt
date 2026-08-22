@@ -5,17 +5,19 @@ yfinance
 jugaad-data
 python-dotenv
 
-# --- Week 2: agent loop (uncomment when you start) ---
-# langgraph
-# langchain-core
+# --- Week 2: agent loop ---
+langgraph
+langchain-core
+langchain_google_genai
 
-# --- Week 3: RAG (uncomment when you start) ---
-# sentence-transformers
-# chromadb
-# tavily-python
+# --- Week 3: RAG  ---
+sentence-transformers
+chromadb
+tavily-python
+rank_bm25
 
-# --- Week 5: evals (uncomment when you start) ---
-# ragas
+# --- Week 5: evals  ---
+ragas
 
-# --- Week 6: deploy (uncomment when you start) ---
-# streamlit
+# --- Week 6: deploy ---
+streamlit

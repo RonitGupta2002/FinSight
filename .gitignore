@@ -8,11 +8,6 @@ venv/
 .venv/
 *.egg-info/
 
-# Data / vector stores (week 3+)
-chroma_db/
-*.sqlite
-*.sqlite3
-
 # OS
 .DS_Store
 
@@ -25,3 +20,4 @@ chroma_db/
 tool_call_log.jsonl
 
 agent_loop/watchlist.db
+.streamlit/secrets.toml

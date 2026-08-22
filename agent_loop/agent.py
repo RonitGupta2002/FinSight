@@ -1,10 +1,3 @@
-"""
-FinSight India — Week 2: the agent loop.
-LangGraph StateGraph that chains week 1's 5 tools across cash-equity and F&O
-queries, deciding the order itself, with a hard cap on loop length and
-step-by-step logging (reused for evals in week 5).
-"""
-
 import sys
 import os
 import json
@@ -13,8 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Annotated, Sequence, TypedDict
 
-# Windows terminals default to cp1252, which can't print ₹ or other non-ASCII
-# characters the model may return. Force UTF-8 on stdout so this doesn't crash.
+# Windows terminals default to cp1252, which can't print ₹ or other non-ASCII characters the model may return. Force UTF-8 on stdout so this doesn't crash.
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -30,34 +22,32 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from langgraph_tools import ALL_TOOLS as MARKET_TOOLS
 
-# --- Week 3 Part 3: bring in the RAG tools (search_filings, search_regulations)
-# alongside the 5 existing market-data tools ---
+# --- Week 3 Part 3: bring in the RAG tools (search_filings, search_regulations) alongside the 5 existing market-data tools
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rag"))
 from retrieval_tools import RAG_TOOLS
 
-# --- Week 4 Part 2: persisted watchlist tools ---
+# --- Week 4 Part 2: persisted watchlist tools
 from watchlist_tools import WATCHLIST_TOOLS
 
 ALL_TOOLS = MARKET_TOOLS + RAG_TOOLS + WATCHLIST_TOOLS
 
-MAX_ITERATIONS = 6  # safety cap — without this, a confused model can loop forever
-                     # and burn your free-tier quota. Tune this up only if you hit
-                     # it on a genuinely multi-hop query, not to paper over a bug.
+MAX_ITERATIONS = 6  # Safety Cap — without this, a confused model can loop forever
+                    # Tune this up only if you hit it on a multi-hop query
 
-# Week 4 Part 3: summarization thresholds. A single turn with several tool
-# calls can easily be 6-10 messages on its own (human question, tool-call
-# request, one ToolMessage per call, final answer) — these numbers are set
-# generously with that in mind, not tuned for simple one-shot Q&A.
+# Week 6 Part 2: `MAX_ITERATIONS` limits the agent’s reasoning turns, but does not limit how many tools Gemini can call within one turn. 
+# `MAX_TOOL_CALLS_PER_QUESTION` adds a separate cap to prevent excessive tool executions and costs when a question triggers many parallel calls.
+MAX_TOOL_CALLS_PER_QUESTION = 15
+
+# Week 4 Part 3: summarization thresholds. A single turn with several tool calls can easily be 6-10 messages on its own — these numbers are set generously with that in mind, not tuned for simple one-shot Q&A.
 SUMMARY_TRIGGER_MESSAGES = 20  # summarize once the buffer exceeds this many messages
-KEEP_RECENT_MESSAGES = 10       # always keep this many of the MOST RECENT messages verbatim
+KEEP_RECENT_MESSAGES = 10      # always keep this many of the MOST RECENT messages 
 
 MAX_RETRIES = 4          # how many times to retry a rate-limited call before giving up
 DEFAULT_BACKOFF = 15     # seconds to wait if the API doesn't tell us how long to wait
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
-# Every tool call this run makes gets logged here — week 5 reuses this shape
-# directly to score tool-call correctness against your eval set.
+# Every tool call this run makes gets logged here — week 5 reuses this shape directly to score tool-call correctness against your eval set.
 TOOL_CALL_LOG = []
 
 
@@ -67,26 +57,16 @@ class AgentState(TypedDict):
     summary: str  # Week 4 Part 3: running summary of older, trimmed-away messages
 
 
-MODEL = "gemini-3.5-flash"  # gemini-2.5-flash failed (not available on this account/key —
-                             # confirmed via list_models.py / direct testing), so back to
-                             # gemini-3.5-flash despite its lower 20/day quota. Key rotation
-                             # (QUESTIONS_PER_KEY below) is what actually compensates for that
-                             # now, not the model choice.
+MODEL = "gemini-3.5-flash"  
 
-# Week 5: automatic key rotation. Built from whatever numbered keys actually
-# exist in .env (GEMINI_API_KEY1, GEMINI_API_KEY2, GEMINI_API_KEY3, ...) —
-# add a third key later and it's picked up automatically, no code change.
-# Falls back to the old single-key names if no numbered keys are set at all,
-# so weeks 1-4's .env setup still works untouched.
-QUESTIONS_PER_KEY = 8  # proactively rotate BEFORE hitting the daily wall, not after —
-                        # matches the batch size these eval runs are already sized for.
+# Automatic Key Rotation.
+QUESTIONS_PER_KEY = 8  # proactively rotate BEFORE hitting the daily wall, not after — matches the batch size these eval runs are already sized for.
 
 CALL_LOG_PATH = os.path.join(os.path.dirname(__file__), "api_call_log.jsonl")
 
 
 def _discover_key_pool() -> list[str]:
-    """Find every GEMINI_API_KEYn defined in .env, in order. Falls back to
-    the older single-key names if none of the numbered ones are set."""
+    """Find every GEMINI_API_KEYn defined in .env, in order. Falls back to the older single-key names if none of the numbered ones are set."""
     pool = []
     i = 1
     while os.environ.get(f"GEMINI_API_KEY{i}"):
@@ -131,9 +111,7 @@ _key_index, _questions_on_current_key = _load_key_state()
 
 def _log_call(purpose: str, key_alias: str, success: bool, error: str = None):
     """Append one line per actual API call — every call, not just failures.
-    This is the raw material for week 5's eval scoring: cost/latency tracking
-    and tool-call correctness both want to know exactly what was called, when,
-    with which key, and whether it succeeded."""
+    Eval Scoring: cost/latency tracking and tool-call correctness both want to know exactly what was called, when, with which key, and whether it succeeded."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "purpose": purpose,          # "agent" | "no_tools" | "summarize"
@@ -147,9 +125,7 @@ def _log_call(purpose: str, key_alias: str, success: bool, error: str = None):
 
 def _build_llm():
     """(Re)build the LLM clients bound to whichever key is currently active.
-    Called once at startup and again every time _rotate_key() switches keys —
-    langchain_google_genai binds an api_key at construction time, so a real
-    key swap means constructing a new client, not just changing a variable."""
+    Called once at startup and again every time _rotate_key() switches keys — langchain_google_genai binds an api_key at construction time, so a real key swap means constructing a new client, not just changing a variable."""
     global llm, llm_with_tools, llm_no_tools
     active_key_name = KEY_POOL[_key_index]
     llm = ChatGoogleGenerativeAI(
@@ -162,9 +138,7 @@ def _build_llm():
 
 
 def _rotate_key():
-    """Move to the next key in the pool and rebuild the LLM clients. Raises
-    once every key in the pool has been used up for this run — at that point
-    waiting for tomorrow (or adding another GEMINI_API_KEYn) is the only option."""
+    """Move to the next key in the pool and rebuild the LLM clients."""
     global _key_index, _questions_on_current_key
     if _key_index + 1 >= len(KEY_POOL):
         raise RuntimeError(
@@ -186,52 +160,33 @@ _build_llm()  # initial construction, using KEY_POOL[0]
 
 SYSTEM_PROMPT = SystemMessage(content=(
     "You are a research assistant for Indian cash equity and F&O markets. "
-    "You have tools for live market data (prices, fundamentals, option chains, repo rate), "
-    "company filings/concall transcripts (search_filings), SEBI regulations (search_regulations), "
-    "and a persisted watchlist (add_to_watchlist, remove_from_watchlist, view_watchlist) that "
-    "survives across sessions. "
-    "Use the tools available to you to answer with real data — don't guess numbers or quote "
-    "regulations from memory. If no tool can answer part of a question, say so plainly instead "
-    "of inventing data.\n\n"
-    "Important: if a search tool returns relevant results that directly answer the question, "
-    "STOP searching and answer immediately — do not repeat the search with reworded queries to "
-    "double-check or look for more detail, even once. Each additional search costs you a "
-    "reasoning step you may need later in the question. If the user asks about a specific "
-    "period (e.g. 'Q3') but the available documents only cover a different period (e.g. 'Q1 FY27'), "
-    "use the most recent available data and clearly tell the user which period it actually covers, "
-    "rather than searching repeatedly for an exact label match that may not exist in the corpus.\n\n"
-    "When the user refers to 'my watchlist', 'the stocks I'm tracking', 'their margins/OI/etc.', "
-    "OR asks you to summarize/recap the conversation, call view_watchlist FIRST to see what's "
-    "ACTUALLY tracked before answering — don't assume, and don't rely on conversation memory alone. "
-    "A stock being discussed or looked up earlier in the conversation does NOT mean it was added to "
-    "the watchlist — only add_to_watchlist actually tracks something. Never state that an instrument "
-    "is 'on the watchlist' unless view_watchlist actually confirms it. "
-    "The watchlist mixes equities and F&O instruments; apply the right kind of follow-up to the "
-    "right kind of instrument (e.g. margin/OI questions to options, fundamentals/price to equities), "
-    "not the same treatment to everything."
-    "If a ticker or company lookup fails and you're unsure which specific "
-    "entity the user means (e.g. a company with multiple listed entities "
-    "after a demerger or restructuring), do NOT guess a DIFFERENT, "
-    "unrelated company just because the name is similar. Either state the "
-    "ambiguity plainly and ask which entity they mean, or clearly state "
-    "which one you're assuming and why — never substitute an entity you "
-    "haven't verified is actually the same business.\n\n"
-    "Week 6 — citations are mandatory, not optional style: any claim drawn from "
-    "search_filings or search_regulations MUST be attributed inline, e.g. "
-    "'(Source: Reliance Industries, Q1_FY27_results.pdf)' for a filing or "
-    "'(Source: SEBI circular, <filename>)' for a regulation — name the actual "
+    "You have tools for live market data (prices, fundamentals, option chains, repo rate), company filings/concall transcripts (search_filings), SEBI regulations "
+    "(search_regulations), and a persisted watchlist (add_to_watchlist, remove_from_watchlist, view_watchlist) that survives across sessions. "
+    "Use the tools available to you to answer with real data — don't guess numbers or quote regulations from memory. "
+    "If no tool can answer part of a question, say so plainly instead of inventing data.\n\n"
+    "Important: if a search tool returns relevant results that directly answer the question, STOP searching and answer immediately — do not repeat the search with reworded "
+    "queries to double-check or look for more detail, even once. Each additional search costs you a reasoning step you may need later in the question. "
+    "If the user asks about a specific period (e.g. 'Q3') but the available documents only cover a different period (e.g. 'Q1 FY27'), use the most recent available data and "
+    "clearly tell the user which period it actually covers, rather than searching repeatedly for an exact label match that may not exist in the corpus.\n\n"
+    "When the user refers to 'my watchlist', 'the stocks I'm tracking', 'their margins/OI/etc.', OR asks you to summarize/recap the conversation, call view_watchlist FIRST "
+    "to see what's ACTUALLY tracked before answering — don't assume, and don't rely on conversation memory alone. "
+    "A stock being discussed or looked up earlier in the conversation does NOT mean it was added to the watchlist — only add_to_watchlist actually tracks something. "
+    "Never state that an instrument is 'on the watchlist' unless view_watchlist actually confirms it. "
+    "The watchlist mixes equities and F&O instruments; apply the right kind of follow-up to the right kind of instrument "
+    "(e.g. margin/OI questions to options, fundamentals/price to equities), not the same treatment to everything. "
+    "If a ticker or company lookup fails and you're unsure which specific entity the user means (e.g. a company with multiple listed entities after a demerger or restructuring), "
+    "do NOT guess a DIFFERENT, unrelated company just because the name is similar. Either state the ambiguity plainly and ask which entity they mean, "
+    "or clearly state which one you're assuming and why — never substitute an entity you haven't verified is actually the same business.\n\n"
+    "Citations are mandatory, not optional style: any claim drawn from search_filings or search_regulations MUST be attributed inline, e.g. "
+    "'(Source: Reliance Industries, Q1_FY27_results.pdf)' for a filing or (Source: SEBI circular, <filename>)' for a regulation — name the actual "
     "company/source returned by the tool, never a generic 'the filing' or 'SEBI says'. "
-    "If search_filings or search_regulations returns no relevant results, say plainly "
-    "that no matching filing/regulation was found for that part of the question — "
+    "If search_filings or search_regulations returns no relevant results, say plainly that no matching filing/regulation was found for that part of the question — "
     "do not answer it from memory or general knowledge instead."
 ))
 
 
 def extract_text(content) -> str:
-    """Gemini 3.5 sometimes returns content as a list of structured blocks
-    (e.g. [{'type': 'text', 'text': '...', 'extras': {...}}]) instead of a
-    plain string. Pull just the human-readable text back out for printing.
-    """
+    """Gemini 3.5 sometimes returns content as a list of structured blocks (e.g. [{'type': 'text', 'text': '...', 'extras': {...}}]). Pull just the human-readable text back out for printing."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -245,14 +200,10 @@ def extract_text(content) -> str:
     return str(content)
 
 def _build_tool_log_digest(tool_log, max_snippets=8, max_chars_per_snippet=300, max_total_chars=3000):
-    """Round 4: guarantee every distinct tool call contributes at least one
-    snippet before spending remaining budget on the highest-relevance
-    leftovers. Round 3 fixed losing data to raw truncation, but a single
-    search call returning several individually-scored sub-results could
-    still crowd out every OTHER tool call's data entirely (confirmed live
-    on multi_05: one 5-result search_filings call filled 5 of 6 digest
-    slots, dropping option-chain and calculate results that were also
-    needed)."""
+    """Round 4: guarantee every distinct tool call contributes at least one snippet before spending remaining budget on the highest-relevance leftovers. 
+    Round 3 fixed losing data to raw truncation, but a single search call returning several individually-scored sub-results could still crowd out 
+    every OTHER tool call's data entirely (confirmed live on multi_05: one 5-result search_filings call filled 5 of 6 digest slots, 
+    dropping option-chain and calculate results that were also needed)."""
     per_call_best = []
     leftover_candidates = []
     for entry in tool_log:
@@ -296,10 +247,6 @@ def _build_tool_log_digest(tool_log, max_snippets=8, max_chars_per_snippet=300, 
 
 RAG_TOOL_NAMES = {"search_filings", "search_regulations"}
 
-# Loose but auditable phrases that count as "the answer admits it found
-# nothing" — used only to gate whether a repair pass is needed, not shown
-# to the user, so false negatives here just mean an unnecessary repair call
-# rather than a wrong answer slipping through.
 NO_DATA_PHRASES = (
     "no relevant", "couldn't find", "could not find", "no matching",
     "not available", "no results", "unable to find", "don't have",
@@ -309,10 +256,8 @@ NO_DATA_PHRASES = (
 
 
 def _rag_calls_this_turn(tool_log):
-    """Inspect this turn's TOOL_CALL_LOG for search_filings/search_regulations
-    calls and classify what actually happened, so citation enforcement can be
-    checked against ground truth instead of assumed from the prompt alone.
-
+    """Inspect this turn's TOOL_CALL_LOG for search_filings/search_regulations calls and classify what actually happened, 
+    so citation enforcement can be checked against ground truth instead of assumed from the prompt alone.
     Returns:
         rag_called: any RAG tool was called this turn at all
         rag_succeeded: at least one RAG call returned real results
@@ -345,13 +290,9 @@ def _rag_calls_this_turn(tool_log):
 
 
 def _answer_cites_sources(answer_text: str, sources: list) -> bool:
-    """A citation counts only if the answer names the actual retrieved SOURCE
-    FILE (or a recognizable chunk of its filename) — not merely the company
-    name. Company-name-only mentions ('According to Reliance's filing...')
-    are exactly the failure mode this check exists to catch: they read as
-    attributed but can't actually be traced back to a specific document.
-    Loose on formatting (doesn't require an exact '(Source: ...)' string),
-    strict on substance (the real filename must appear somewhere)."""
+    """A citation counts only if the answer names the actual retrieved SOURCE  FILE (or a recognizable chunk of its filename) — not merely the company name. 
+    Company-name-only mentions ('According to Reliance's filing...') are exactly the failure mode this check exists to catch: they read as attributed but can't actually be traced back to a specific document.
+    Loose on formatting (doesn't require an exact '(Source: ...)' string), strict on substance (the real filename must appear somewhere)."""
     if not sources:
         return True  # nothing was retrieved, so nothing to cite
     text_lower = answer_text.lower()
@@ -360,10 +301,8 @@ def _answer_cites_sources(answer_text: str, sources: list) -> bool:
         if not src:
             continue
         stem = os.path.splitext(src)[0]
-        # Require the full filename, or a substantial (>=15 char) chunk of its
-        # stem — long enough that it can't be satisfied by coincidence or by
-        # a generic phrase, short enough to tolerate the model truncating a
-        # very long filename when it quotes it.
+        # Require the full filename, or a substantial (>=15 char) chunk of its stem — long enough that it can't be satisfied by coincidence or by
+        # a generic phrase, short enough to tolerate the model truncating a very long filename when it quotes it.
         if src in text_lower or (len(stem) >= 15 and stem[:40].lower() in text_lower):
             return True
     return False
@@ -375,21 +314,10 @@ def _answer_acknowledges_no_data(answer_text: str) -> bool:
 
 
 def enforce_citations_and_refusals(question: str, answer_text: str, thread_id: str) -> str:
-    """Week 6, Part 1: the verification layer behind the system prompt's
-    citation/refusal instructions. Two checks, run against what TOOL_CALL_LOG
-    actually shows happened this turn — not against what the model claims:
+    """Week 6, Part 1: the verification layer behind the system prompt's citation/refusal instructions. Two checks, run against what TOOL_CALL_LOG actually shows happened this turn — not against what the model claims:
 
-    (a) If every filings/regulations search this turn came back empty, the
-        answer must say so plainly, not quietly answer from general knowledge.
-    (b) If filings/regulations WERE retrieved and used, the answer must name
-        the actual source — an unattributed claim next to a successful RAG
-        call is exactly the failure mode citation enforcement exists to catch.
-
-    Both repairs reuse the same pattern as the cap-recovery fallback earlier
-    in this file: one extra no-tools call, given the draft answer and the
-    concrete facts needed, asked to fix ONLY the specific problem rather than
-    rewrite the whole thing. If the repair call itself comes back empty, the
-    original answer is kept rather than replaced with nothing.
+    (a) If every filings/regulations search this turn came back empty, the answer must say so plainly, not quietly answer from general knowledge.
+    (b) If filings/regulations WERE retrieved and used, the answer must name the actual source — an unattributed claim next to a successful RAG call is exactly the failure mode citation enforcement exists to catch.
     """
     rag_called, rag_succeeded, sources, errored_only = _rag_calls_this_turn(TOOL_CALL_LOG)
     if not rag_called:
@@ -432,30 +360,74 @@ def enforce_citations_and_refusals(question: str, answer_text: str, thread_id: s
     return answer_text
 
 
+OPTION_TOOL_NAMES = {"get_option_chain"}
+
+DISCLAIMER_TEXT = (
+    "\n\n_This information is for research purposes only and is not a trading "
+    "recommendation. Please do your own due diligence or consult a financial "
+    "advisor before making any trading decisions._"
+)
+
+
+DISCLAIMER_PHRASES = (
+    "not a trading recommendation", "not financial advice", "not investment advice",
+    "for research purposes only", "not a recommendation to trade",
+    "consult a financial advisor", "do your own due diligence",
+)
+
+
+def _option_data_used_this_turn(tool_log) -> bool:
+    """True if get_option_chain was called this turn AND actually returned
+    real data (not an error) — a failed lookup doesn't need a disclaimer,
+    since there's no F&O data in the answer to disclaim about."""
+    for entry in tool_log:
+        if entry.get("tool") not in OPTION_TOOL_NAMES:
+            continue
+        raw = entry.get("result", "")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and "error" not in parsed:
+            return True
+    return False
+
+
+def ensure_fo_disclaimer(answer_text: str) -> str:
+    """Week 6, Part 2: append the F&O research-not-advice disclaimer whenever option chain/OI data was actually used this turn and the answer doesn't
+    already carry an equivalent disclaimer. Deliberately a cheap string append, not another LLM call — the disclaimer is boilerplate, not 
+    something that needs rephrasing per answer, so there's no reason to spend quota rewriting it in each time."""
+    if not _option_data_used_this_turn(TOOL_CALL_LOG):
+        return answer_text
+    text_lower = answer_text.lower()
+    if any(phrase in text_lower for phrase in DISCLAIMER_PHRASES):
+        return answer_text
+    return answer_text.rstrip() + DISCLAIMER_TEXT
+
+
+def apply_guardrails(question: str, answer_text: str, thread_id: str) -> str:
+    """Single entry point for every Week 6 post-processing check run on a final answer: citation enforcement + no-data refusals (Part 1), then the
+    F&O disclaimer (Part 2). Order matters — citation repair can rewrite the whole answer, so the disclaimer check runs last against whatever text actually ships."""
+    answer_text = enforce_citations_and_refusals(question, answer_text, thread_id)
+    answer_text = ensure_fo_disclaimer(answer_text)
+    return answer_text
+
+
 def invoke_with_retry(messages):
-    """Wraps the LLM call with retry + backoff on rate limits (HTTP 429).
-    Free-tier quotas are small (as low as 5 requests/minute on some models) —
-    a multi-hop query alone can exhaust it, so this is not optional plumbing,
-    it's the difference between the script working and crashing mid-run.
-    """
+    """Wraps the LLM call with retry + backoff on rate limits (HTTP 429). Free-tier quotas are small (as low as 5 requests/minute on some models) —
+    a multi-hop query alone can exhaust it, so this is not optional plumbing, it's the difference between the script working and crashing mid-run. """
     return _invoke_with_retry(llm_with_tools, messages, purpose="agent")
 
 
 def invoke_with_retry_no_tools(messages):
-    """Same retry/backoff, but against the no-tools model — used only for the
-    cap-recovery fallback in ask(), so the model can't request another tool
-    call it won't be allowed to make."""
+    """Same retry/backoff, but against the no-tools model — used only for the cap-recovery fallback in ask(), so the model can't request another tool call it won't be allowed to make."""
     return _invoke_with_retry(llm_no_tools, messages, purpose="no_tools")
 
 
 class DailyQuotaExhausted(Exception):
-    """Raised when the API reports a per-day (not per-minute) quota is used up.
-    Unlike a per-minute rate limit, no amount of waiting within the same day
-    fixes this — retrying is actively counterproductive, so this is raised
-    immediately instead of going through the backoff loop. With proactive
-    rotation (QUESTIONS_PER_KEY) this should be rare in practice — it's the
-    safety net for when a key was already partially used before this run
-    started, not the primary rotation mechanism."""
+    """Raised when the API reports a per-day (not per-minute) quota is used up. Unlike a per-minute rate limit, no amount of waiting within the same day fixes this — 
+    retrying is actively counterproductive, so this is raised immediately instead of going through the backoff loop. With proactive rotation (QUESTIONS_PER_KEY) 
+    this should be rare in practice — it's the safety net for when a key was already partially used before this run started, not the primary rotation mechanism."""
     pass
 
 
@@ -469,10 +441,6 @@ def _invoke_with_retry(model, messages, purpose: str = "agent"):
         except ChatGoogleGenerativeAIError as e:
             msg = str(e)
 
-            # A daily quota (RPD) exhaustion looks like a 429 too, but retrying
-            # within the same day cannot fix it — Google's daily quotas reset on
-            # a rolling ~24h basis, not on a per-minute backoff timescale. Fail
-            # fast with a clear message instead of burning retries and time.
             if "PerDay" in msg or "RequestsPerDay" in msg:
                 _log_call(purpose, key_alias, success=False, error="daily_quota_exhausted")
                 raise DailyQuotaExhausted(
@@ -501,9 +469,7 @@ def call_agent(state: AgentState) -> dict:
     messages = [SYSTEM_PROMPT]
     summary = state.get("summary", "")
     if summary:
-        # The running summary stands in for messages that have been trimmed
-        # away (see summarize_if_needed) — without this, trimming would mean
-        # genuinely forgetting things, not just compressing them.
+        # The running summary stands in for messages that have been trimmed away (see summarize_if_needed) — without this, trimming would mean genuinely forgetting things, not just compressing them.
         messages.append(SystemMessage(content=f"Summary of earlier conversation:\n{summary}"))
     messages += list(state["messages"])
     response = invoke_with_retry(messages)
@@ -518,11 +484,24 @@ def call_tools(state: AgentState) -> dict:
 
     for call in last_message.tool_calls:
         name, args, call_id = call["name"], call["args"], call["id"]
+
+        if len(TOOL_CALL_LOG) >= MAX_TOOL_CALLS_PER_QUESTION:
+            # Hard stop — don't execute, don't log as a real call. The model still gets a ToolMessage (LangChain requires one per tool_call id in the batch), 
+            # but it's an explicit refusal, not data, so it steers the model toward wrapping up rather than silently dropping the request.
+            result = json.dumps({
+                "error": f"Tool-call budget for this question ({MAX_TOOL_CALLS_PER_QUESTION} "
+                         "calls) has been reached. Answer using the information already "
+                         "gathered instead of requesting more tools."
+            })
+            print(f"[tool-call cap] Refusing {name}({args}) — budget of "
+                  f"{MAX_TOOL_CALLS_PER_QUESTION} tool calls reached this question.")
+            tool_messages.append(ToolMessage(content=result, tool_call_id=call_id))
+            continue
+
         tool_fn = TOOL_MAP.get(name)
 
         if tool_fn is None:
-            # Day 5 "break it" case: model hallucinated a tool that doesn't exist.
-            # Fail gracefully — tell the model, don't crash the loop.
+            # Day 5 "break it" case: model hallucinated a tool that doesn't exist. Don't crash the loop.
             result = json.dumps({"error": f"No tool named '{name}' exists."})
         else:
             try:
@@ -558,22 +537,15 @@ graph.set_entry_point("agent")
 graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
 graph.add_edge("tools", "agent")  # loop back — this is what makes it an agent, not a one-shot call
 
-# Week 4 Part 1: InMemorySaver gives the graph a conversation buffer — state
-# (the messages list) persists across multiple .invoke() calls as long as they
-# share the same thread_id. This is SESSION-only memory: it lives in RAM and
-# is gone the moment the script exits. Part 2 upgrades this to SqliteSaver,
-# which persists to disk and survives between separate script runs.
+# Week 4 Part 1: InMemorySaver gives the graph a conversation buffer — state (the messages list) persists across multiple .invoke() calls as long as they share the same thread_id. 
+# This is SESSION-only memory: it lives in RAM and is gone the moment the script exits. Part 2 upgrades this to SqliteSaver, which persists to disk and survives between separate script runs.
 checkpointer = InMemorySaver()
 app = graph.compile(checkpointer=checkpointer)
 
 
 def summarize_if_needed(thread_id: str):
-    """Week 4 Part 3: check this thread's message count, and if it's over the
-    threshold, compress everything except the most recent messages into a
-    running summary. Call this after a turn completes (see ask() below) —
-    not mid-turn, since trimming messages while the agent is still reasoning
-    about the current question could remove something it's actively using.
-    """
+    """Week 4 Part 3: check this thread's message count, and if it's over the threshold, compress everything except the most recent messages into a running summary. 
+    Call this after a turn completes (see ask() below) — not mid-turn, since trimming messages while the agent is still reasoning about the current question could remove something it's actively using."""
     config = {"configurable": {"thread_id": thread_id}}
     state = app.get_state(config).values
     messages = state.get("messages", [])
@@ -585,9 +557,7 @@ def summarize_if_needed(thread_id: str):
     to_keep = messages[-KEEP_RECENT_MESSAGES:]
     existing_summary = state.get("summary", "")
 
-    # Build the summarization prompt — explicitly ask the model to preserve
-    # concrete facts (tickers, figures, watchlist items) since THOSE are what
-    # follow-up questions actually need, not a vague narrative recap.
+    # Build the summarization prompt — explicitly ask the model to preserve concrete facts (tickers, figures, watchlist items)
     convo_text = "\n".join(
         f"{m.__class__.__name__}: {extract_text(m.content)}"
         for m in to_summarize if hasattr(m, "content")
@@ -604,16 +574,12 @@ def summarize_if_needed(thread_id: str):
 
     print(f"[summarizing] {len(to_summarize)} older messages -> compressed summary "
           f"(keeping last {len(to_keep)} messages verbatim)")
-    # Sent as a HumanMessage, not a SystemMessage — Gemini's API requires actual
-    # conversation content ('contents') separately from system instructions,
-    # and a request containing ONLY a system message has no contents at all,
-    # which errors with "contents are required". A HumanMessage always counts
-    # as real content.
+    # Sent as a HumanMessage, not a SystemMessage — Gemini's API requires actual conversation content ('contents') separately from system instructions,
+    # and a request containing ONLY a system message has no contents at all, which errors with "contents are required". A HumanMessage always counts as real content.
     response = invoke_with_retry_no_tools([HumanMessage(content=prompt)])
     new_summary = extract_text(response.content)
 
-    # RemoveMessage actually deletes these from the checkpointed state — this
-    # is real trimming, not just hiding them from one LLM call.
+    # RemoveMessage actually deletes these from the checkpointed state — this is real trimming, not just hiding them from one LLM call.
     remove_ops = [RemoveMessage(id=m.id) for m in to_summarize if hasattr(m, "id") and m.id]
     app.update_state(config, {"messages": remove_ops, "summary": new_summary})
 
@@ -629,23 +595,15 @@ def ask(question: str, thread_id: str = "default"):
         raise
 
 def _ask_impl(question: str, thread_id: str = "default"):
-    """Ask a question within a conversation thread. Calling this multiple times
-    with the SAME thread_id lets the model see the full prior conversation —
-    that's the actual Week 4 Part 1 deliverable. Different thread_id = a totally
-    separate, unrelated conversation (useful for testing in isolation).
+    """Ask a question within a conversation thread. Calling this multiple times with the SAME thread_id lets the model see the full prior conversation —
+    that's the actual Week 4. Different thread_id = a totally separate, unrelated conversation (useful for testing in isolation).
 
-    Note the explicit iterations=0 reset below: 'iterations' is a plain (non-
-    reducer) state field, so passing it in the input REPLACES the checkpointed
-    value rather than accumulating like 'messages' does. This is deliberate —
-    without it, the iteration cap would apply to the ENTIRE conversation's
-    total tool calls instead of resetting per turn, and a long conversation
-    would hit the cap after just a few turns even if each individual turn only
-    needed 1-2 tool calls.
+    Note the explicit iterations=0 reset below: 'iterations' is a plain (non-reducer) state field, so passing it in the input REPLACES the checkpointed value rather than 
+    accumulating like 'messages' does. This is deliberate — without it, the iteration cap would apply to the ENTIRE conversation's total tool calls instead of resetting 
+    per turn, and a long conversation would hit the cap after just a few turns even if each individual turn only needed 1-2 tool calls.
 
-    Week 5: also handles automatic key rotation — every call increments a
-    per-key question counter, and rotates to the next configured key BEFORE
-    the QUESTIONS_PER_KEY limit is exceeded, rather than waiting for an
-    actual quota error.
+    Week 5: also handles automatic key rotation — every call increments a per-key question counter, and rotates to the next configured key BEFORE
+    the QUESTIONS_PER_KEY limit is exceeded, rather than waiting for an actual quota error.
     """
     print(f"\n=== {question} ===")
     global _questions_on_current_key
@@ -660,11 +618,6 @@ def _ask_impl(question: str, thread_id: str = "default"):
     result = app.invoke({"messages": [("user", question)], "iterations": 0}, config)
     last_message = result["messages"][-1]
 
-    # If the iteration cap was hit WHILE the model still wanted to call more
-    # tools, the last message has no real answer in it — just an unexecuted
-    # tool request. Rather than show the user a blank/empty response, force
-    # one more direct call asking the model to answer with whatever it has
-    # already gathered, tools disabled this time so it can't request another.
     if getattr(last_message, "tool_calls", None):
         print("[recovering from cap] Forcing a final answer from partial results...")
         wrapup_prompt = SystemMessage(content=(
@@ -678,17 +631,7 @@ def _ask_impl(question: str, thread_id: str = "default"):
         final_response = invoke_with_retry_no_tools(messages)
         answer_text = extract_text(final_response.content)
 
-        # Observed failure mode (fund_05, filing_04 eval runs): the wrap-up call
-        # itself can come back with zero content blocks, which extract_text()
-        # renders as the literal string "[]". Fall back to a deterministic,
-        # honest message built from the raw tool log instead of showing nothing.
         if not answer_text.strip() or answer_text.strip() == "[]":
-            # First synthesis attempt came back empty. Before giving up, try
-            # once more with a short, directive prompt built from just the
-            # raw tool results already gathered — both fund_05 and
-            # filing_04/filing_05 had the real answer sitting in
-            # TOOL_CALL_LOG at this exact point; the original wrap-up call
-            # just never surfaced it.
             digest = _build_tool_log_digest(TOOL_CALL_LOG)
             if digest:
                 print("[recovering from cap] First synthesis was empty — "
@@ -713,7 +656,7 @@ def _ask_impl(question: str, thread_id: str = "default"):
                 "question at a time."
             )
 
-        answer_text = enforce_citations_and_refusals(question, answer_text, thread_id)
+        answer_text = apply_guardrails(question, answer_text, thread_id)
 
         print(f"[final answer] {answer_text}")
 
@@ -724,7 +667,7 @@ def _ask_impl(question: str, thread_id: str = "default"):
         return result
 
     answer_text = extract_text(last_message.content)
-    fixed_text = enforce_citations_and_refusals(question, answer_text, thread_id)
+    fixed_text = apply_guardrails(question, answer_text, thread_id)
     if fixed_text != answer_text:
         fixed_message = AIMessage(content=fixed_text)
         app.update_state(config, {"messages": [fixed_message]})
@@ -737,15 +680,11 @@ def _ask_impl(question: str, thread_id: str = "default"):
 
 
 def chat():
-    """Week 4 Part 1's actual deliverable: an interactive, multi-turn
-    conversation. Every question you type shares the same thread_id, so the
-    model can see everything said earlier in this session — try asking
-    something, then a follow-up using 'it'/'that'/'their' and see if it
-    resolves correctly using the conversation buffer.
-
-    Type 'exit' or 'quit' to end. This is SESSION-only memory (Part 1) — once
-    you exit, the conversation is gone. Part 2 adds a persisted watchlist that
-    survives between runs.
+    """
+    Week 4 Part 1's: an interactive, multi-turn conversation. Every question you type shares the same thread_id, so the  model can see everything said earlier in 
+    this session — try asking something, then a follow-up using 'it'/'that'/'their' and see if it resolves correctly using the conversation buffer.
+ 
+    Type 'exit' or 'quit' to end. This is SESSION-only memory (Part 1) — once you exit, the conversation is gone. Part 2 adds a persisted watchlist that survives between runs.
     """
     thread_id = f"session-{int(time.time())}"
     print("FinSight India — interactive mode. Type 'exit' or 'quit' to end.\n")
@@ -770,11 +709,6 @@ def chat():
 
 
 def regression_test():
-    """The old scripted test sequence from weeks 2-3 — each question runs in
-    its OWN thread_id (see the thread_id= arg below), so they're deliberately
-    isolated from each other, unlike chat() where every question shares one
-    thread. Useful for confirming nothing regressed, but burns 4 queries'
-    worth of daily quota every run — prefer chat() for everyday testing."""
     queries = [
         "Is TCS's P/E higher than Infosys's, and is there unusual options activity "
         "building up in NIFTY this week?",
@@ -802,19 +736,6 @@ def regression_test():
 
 
 def stress_test():
-    """Week 4 Part 3's Day 6-7 deliverable: a 15+ turn conversation, all in ONE
-    thread, deliberately mixing equity and F&O references so later turns must
-    correctly resolve pronouns/references against a summarized (not fully raw)
-    history — this only becomes a real test once summarization has actually
-    kicked in partway through, not before.
-
-    WARNING ON QUOTA: 15 turns, several of which need multiple tool calls, can
-    easily approach or exceed a 20-req/day free-tier cap in ONE run. If you hit
-    DailyQuotaExhausted partway through, that's expected — note which turn
-    number it stopped at and resume the rest tomorrow, or switch to a model
-    with a higher daily cap (see MODEL near the top of this file) before
-    re-running the whole thing in one sitting.
-    """
     thread_id = f"stress-test-{int(time.time())}"
     turns = [
         "Track HDFC Bank, ICICI Bank, and NIFTY weekly options",                         # 1

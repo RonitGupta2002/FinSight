@@ -1,14 +1,13 @@
 """
 FinSight India — Week 2: LangChain tool wrappers around week 1's plain functions.
-No new logic here — this file's only job is adapting week1's functions to the
-shape LangGraph/LangChain expects (the @tool decorator + JSON-string returns).
+No new logic here — this file's only job is adapting week1's functions to the shape LangGraph/LangChain expects (the @tool decorator + JSON-string returns).
 """
 
 import sys
 import os
 import json
 
-# Reuse week 1's tools directly instead of duplicating logic
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tool_calling"))
 from tools_def import (
     get_stock_price as _get_stock_price,

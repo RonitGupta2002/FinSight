@@ -1,8 +1,6 @@
 """
-One-time diagnostic — lists every model actually available to YOUR API key
-right now, plus what each one supports. Run this once, then set MODEL in
-agent.py to something that actually shows up here — don't guess from blog
-posts (they go stale fast, as we just saw with gemini-2.5-flash).
+One-time diagnostic — lists every model actually available to YOUR API key right now, plus what each one supports. Run this once, then set MODEL in
+agent.py to something that actually shows up here — don't guess from blog posts (they go stale fast, as we just saw with gemini-2.5-flash).
 """
 
 import os

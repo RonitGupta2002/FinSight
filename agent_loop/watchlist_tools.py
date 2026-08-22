@@ -1,8 +1,7 @@
 """
 FinSight India — Week 4, Part 2: watchlist tools for the agent.
 
-Thin @tool wrappers over watchlist.py, same pattern as week 3's
-retrieval.py -> retrieval_tools.py. No storage logic lives here.
+Thin @tool wrappers over watchlist.py, same pattern as week 3's retrieval.py -> retrieval_tools.py. No storage logic lives here.
 """
 
 import json
