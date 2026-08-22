@@ -19,5 +19,4 @@ venv/
 
 tool_call_log.jsonl
 
-agent_loop/watchlist.db
 .streamlit/secrets.toml
