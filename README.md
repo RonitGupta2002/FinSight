@@ -1,126 +1,156 @@
-# FinSight India
+# 📈 FinSight India
 
-An agentic research assistant over NSE/BSE cash equities, F&O data, company filings/concalls, and SEBI regulations — built as a 6-week self-directed learning project on a 100% free-tier stack.
+**An agentic research assistant for Indian cash equity and F&O markets** — built end-to-end over 6 weeks: raw tool calling → an agent loop → hybrid RAG over real filings and SEBI regulations → persisted memory → RAGAS + tool-call evals → citation/disclaimer guardrails and public deployment.
 
-**Build order:** tool calling → agent loop → RAG → memory → evals → guardrails + deploy.
+**Live demo:** https://finsight-ind.streamlit.app/
+*(Free-tier hosting — the app may need a moment to wake up if it's been idle, and sleep until then.)*
 
-This order is deliberate: the agent loop is built before RAG, so orchestration is understood on its own terms before retrieval gets tangled in. By Week 3, RAG slots in as just another tool the agent already knows how to call.
+---
 
-> ⚠️ **Not investment advice.** All F&O/equity outputs are for research and learning purposes only.
+## What it does
 
-**Status: Weeks 1–5 complete.** Week 6 (guardrails + deploy) is in progress. See [Architecture](#architecture) for what's built and [Results](#results) for eval numbers.
+Ask it things like:
+- *"Is TCS's P/E higher than Infosys's, and is there unusual options activity building up in NIFTY this week?"*
+- *"What did Reliance's latest filing say about Jio's subscriber growth?"*
+- *"Has SEBI changed F&O lot-size rules recently?"*
 
-## Stack (100% free tier)
+The agent decides on its own which of 10 tools to call — live price/fundamentals lookups, an NSE option chain, the RBI repo rate, hybrid search over real company filings, hybrid search over SEBI circulars, and a persisted watchlist — chains as many as a question needs, and answers with citations pointing back to the actual source document, never a bare assertion.
 
-| Layer | Tool |
-|---|---|
-| LLM | Google Gemini API (primary) + Groq (fast/backup) |
-| Orchestration | LangGraph |
-| Embeddings | sentence-transformers (local) |
-| Vector DB | Chroma (local) |
-| Reranker | local cross-encoder |
-| Web search | Tavily (free tier) |
-| Cash equity data | yfinance (`.NS` / `.BO` tickers) |
-| F&O + macro data | jugaad-data / nsepython |
-| Filings/concalls | NSE/BSE corporate announcement pages, company IR pages |
-| Regulations | SEBI circulars (sebi.gov.in) |
-| Eval | RAGAS |
-| Deploy | Streamlit Community Cloud / HuggingFace Spaces |
+---
 
 ## Architecture
 
-By the end of Week 4 the agent has **10 tools**, orchestrated as a LangGraph ReAct loop with conversation memory and a hardened iteration-cap recovery path:
+```mermaid
+flowchart TD
+    U[User — Streamlit UI] --> A[LangGraph Agent Loop]
+    A -->|reason| A
+    A --> T1[Market Data Tools<br/>price · fundamentals · option chain · repo rate · calculate]
+    A --> T2[Hybrid RAG — Filings<br/>BM25 + embeddings + cross-encoder rerank]
+    A --> T3[Hybrid RAG — SEBI Regulations<br/>same pipeline, separate corpus]
+    A --> T4[Watchlist Tools<br/>SQLite-persisted, mixed equity/F&O]
+    T1 --> A
+    T2 --> A
+    T3 --> A
+    T4 --> A
+    A --> G[Guardrail Layer]
+    G -->|"citations missing on real RAG results"| R1[Repair pass: add sources]
+    G -->|"all RAG calls came back empty"| R2[Repair pass: state no data found]
+    G -->|"F&O data was used"| R3[Append research-only disclaimer]
+    G --> OUT[Final Answer]
+    OUT --> U
+```
 
-- **5 market-data tools** (Week 1) — `get_stock_price`, `get_company_overview`, `get_option_chain`, `get_repo_rate`, `calculate`
-- **2 RAG tools** (Week 3) — `search_filings(query, company=None)`, `search_regulations(query)`. Hybrid BM25 + embedding retrieval, cross-encoder reranked, over **813 chunks** from 6 companies (TCS, Infosys, Reliance, HDFC Bank, ICICI Bank, Tata Motors) plus SEBI circulars
-- **3 watchlist tools** (Week 4) — `add_to_watchlist`, `remove_from_watchlist`, `view_watchlist`. SQLite-persisted, mixes equity and F&O instrument types with domain-aware routing (e.g. "margin" correctly resolves to NIM for banks vs. options margin for NIFTY)
+Retrieval itself is two independent corpora — real company filings/concalls and SEBI circulars — each chunked, embedded (`all-MiniLM-L6-v2`), stored in ChromaDB, retrieved via **BM25 + embedding similarity**, then re-scored by a **cross-encoder** for final precision. The agent picks the right corpus per question on its own; it isn't hardcoded per query type.
 
-Memory (Week 4) adds session-scoped conversation buffering, a watchlist that survives across process restarts, and running-summary compression for long conversations. The agent loop (Week 2) enforces a hard iteration cap with a multi-round cap-recovery fallback, hardened in Week 5 after live evals surfaced four distinct ways a rushed recovery could lose or misreport already-gathered data.
+---
 
-## Results
+## Key engineering decisions
 
-**Tool-call correctness** — 33 held-out questions, live-run against real Gemini calls:
+- **Verification over prompt reliance.** Citation enforcement and the F&O disclaimer aren't just system-prompt instructions — they're code that inspects the actual tool-call log after every answer and triggers a targeted repair pass if a claim lacks a real source, or if F&O data shipped without the required disclaimer.
+- **Two independent hard caps.** `MAX_ITERATIONS` limits reasoning turns; `MAX_TOOL_CALLS_PER_QUESTION` separately limits total tool executions, since one reasoning turn can request several tool calls at once — conflating the two was a real gap found and fixed during build.
+- **Real bugs found by testing against real data**, not assumed correct from reading the code — repeated across every week of this build. A few examples: a citation check that initially accepted a bare company-name mention as "cited" (too loose — tightened to require the actual source filename); a cap-recovery path that could silently discard an already-correct answer; RAGAS's own broken upstream import, worked around with a compatibility shim rather than downgrading and breaking other dependencies.
+- **Thin adapters, one implementation per concern.** `retrieval_tools.py`, `watchlist_tools.py`, and `deploy/app.py` all contain zero duplicated logic — they wrap `retrieval.py`, `watchlist.py`, and `agent.py` respectively, so a fix made in one place is inherited everywhere it's used, never re-implemented and re-tested twice.
+
+---
+
+## Eval results (Week 5)
+
+Scored against a held-out 33-question set spanning all 5 tool types plus multi-hop combinations.
+
+**Tool-call correctness** (does the agent call the right tools?):
 
 | Category | Recall | Precision |
 |---|---|---|
-| price | 1.000 | 0.800 |
-| fundamentals | 1.000 | 0.840 |
-| option_chain | 1.000 | 0.767 |
-| filing | 1.000 | 0.525 |
-| regulation | 1.000 | 0.756 |
-| multi_hop | 1.000 | 0.567 |
-| **Overall** | **1.000** | **0.701** |
+| Overall | **1.000** | 0.701 |
+| Filing | 1.000 | 0.525 |
+| Fundamentals | 1.000 | 0.840 |
+| Multi-hop | 1.000 | 0.567 |
+| Option chain | 1.000 | 0.767 |
+| Price | 1.000 | 0.800 |
+| Regulation | 1.000 | 0.756 |
 
-15 of 33 questions scored below 1.0 on precision. Manual review classified these as: **9 good-faith "extra rigor"** (calls that improved the answer), **4 real failures** (all traced to one root cause — over-searching past a sufficient answer, triggering the iteration cap), and **2 partial answers** (facts correctly recovered, question not fully answered). All 4 real failures were diagnosed and fixed across four rounds of patches to the cap-recovery path.
+Recall was a clean 1.000 throughout. Precision losses were manually read and classified, not left as raw numbers: **4 genuine failures** (all traced to the same root cause — over-searching past a sufficient answer, hitting the iteration cap, and losing the answer during recovery — found and fixed across 4 rounds of patches), **2 partial answers** (facts correctly recovered but the interpretive question not fully answered), and **9 cases of good-faith extra rigor** (additional tool calls that produced a *better* answer, not a worse one).
 
-**RAG retrieval quality** — RAGAS context precision/recall, LLM-as-judge:
+**Retrieval quality (RAGAS)** — regulations retrieval meaningfully outperformed filings:
 
-| Corpus | Context precision | Context recall |
+| Corpus | Context Precision | Context Recall |
 |---|---|---|
 | Filings | 0.375 | 0.250 |
 | Regulations | 0.769 | 0.800 |
 
-Filings retrieval is the weakest part of the system, confirmed independently by both scoring methods — a candidate area to revisit before Week 6.
+---
 
-## Repo structure
+## Tech stack
+
+| Layer | Tool |
+|---|---|
+| LLM | Google Gemini (`gemini-3.5-flash`) |
+| Agent orchestration | LangGraph `StateGraph` |
+| Retrieval | Hybrid BM25 + `sentence-transformers` embeddings + cross-encoder reranking, via ChromaDB |
+| Market/F&O data | `yfinance`, `jugaad-data` (NSE option chains, RBI repo rate) |
+| Memory | LangGraph checkpointer (session) + SQLite (persisted watchlist) |
+| Evals | RAGAS (retrieval) + custom tool-call correctness scorer |
+| Deployment | Streamlit Community Cloud |
+
+---
+
+## Project structure
 
 ```
-finsight-india/
-├── tool_calling/          # Week 1 — raw tool calling, no framework
-│   └── tools_def.py       # get_stock_price, get_company_overview, get_option_chain, get_repo_rate, calculate
-├── agent_loop/             # Week 2, 4 — LangGraph ReAct loop, memory, watchlist
-│   ├── agent.py            # StateGraph, checkpointer, cap-recovery, retry/backoff, key rotation
-│   ├── langgraph_tools.py  # wraps tool_calling/ + rag/ as LangGraph tool nodes
-│   ├── watchlist.py        # SQLite CRUD for the persisted watchlist
-│   └── watchlist_tools.py  # add_to_watchlist / remove_from_watchlist / view_watchlist
-├── rag/                     # Week 3 — filings + SEBI regulation retrieval
-│   ├── ingest.py            # extract → chunk → embed → store in Chroma
-│   ├── retrieval.py         # hybrid_search() — BM25 + embeddings + cross-encoder rerank
-│   ├── retrieval_tools.py   # thin @tool wrappers around retrieval.py
-│   ├── test_retrieval.py
-│   └── data/                # source PDFs: one folder per company + Regulations/ (gitignored)
-├── evals/                   # Week 5 — RAGAS + tool-call-correctness scoring
-│   ├── eval_set.py          # 33 held-out questions across 6 categories
-│   ├── ragas_eval.py        # context precision/recall on filings + regulation corpora
-│   ├── tool_eval.py         # offline scorer — recall/precision on tool calls
-│   ├── run_tool_eval.py     # resumable, quota-aware live batch runner
-│   └── aggregate_report.py  # dedupes + classifies results (rigor / partial / real failure)
-├── week6_deploy/            # not started — guardrails, Streamlit UI, deployment
-├── chroma_db/                # local vector store (gitignored)
-├── requirements.txt
-├── .env.example
-└── .gitignore
+FinSight/
+├── tool_calling/       # Week 1 — 5 standalone tools, provider-agnostic
+├── agent_loop/         # Week 2, 4, 6 — LangGraph agent, memory, watchlist, guardrails
+│   └── agent.py        #   the whole agent: tools, loop, memory, citation/disclaimer enforcement
+├── rag/                # Week 3 — ingestion, hybrid retrieval, RAG tools, Chroma DB
+├── evals/              # Week 5 — eval set, RAGAS scoring, tool-call scoring, aggregate report
+├── deploy/
+│   └── app.py           # Week 6 — Streamlit UI, thin wrapper over agent.py
+└── requirements.txt
 ```
 
-## Setup
+---
+
+## Running it locally
 
 ```bash
-git clone <your-repo-url>
-cd finsight-india
+git clone https://github.com/RonitGupta2002/FinSight.git
+cd FinSight
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+venv\Scripts\activate          # or source venv/bin/activate on Mac/Linux
 pip install -r requirements.txt
-cp .env.example .env       # then fill in your free API keys
 ```
 
-Free API keys needed:
-- **Gemini**: [aistudio.google.com](https://aistudio.google.com) — no card required
-- **Groq**: [console.groq.com](https://console.groq.com) — no card required
-- **Tavily** (Week 3+): [tavily.com](https://tavily.com) — free tier
+Create a `.env` file in the project root:
+```
+GEMINI_API_KEY1=your-key-here
+GEMINI_API_KEY2=your-second-key-here   # optional — enables rotation once the first hits its daily cap
+```
 
-Before running Week 3+, populate `rag/data/<company>/` with filing/concall PDFs and `rag/data/Regulations/` with SEBI circulars, then build the vector store:
-
+Run the terminal agent directly:
 ```bash
-cd rag
-python ingest.py
+cd agent_loop
+python agent.py
 ```
 
-## Progress
+Or run the full UI:
+```bash
+streamlit run deploy/app.py
+```
 
-- [x] Week 1 — Tool calling (5 tools, wired to both Gemini and Groq)
-- [x] Week 2 — Agent loop (LangGraph ReAct, multi-hop tool chaining)
-- [x] Week 3 — RAG (813 chunks, hybrid retrieval + reranking, 7 tools total)
-- [x] Week 4 — Memory (session memory, persisted mixed-type watchlist, summarization)
-- [x] Week 5 — Evals (33-question eval set, RAGAS + tool-call scoring, 4 bugs found and fixed)
-- [ ] Week 6 — Guardrails + deploy
-- [ ] Week 7 (stretch) — Multi-agent critic
+---
+
+## Known limitations
+
+- **Free-tier daily quota (~20 requests/day/key).** The agent detects and rotates between multiple `GEMINI_API_KEYn` keys automatically, but heavy use can still exhaust all configured keys until the next daily reset.
+- **Watchlist changes on the live demo are session-only.** Streamlit Community Cloud's free tier rebuilds the app container from GitHub on every redeploy/reboot, so anything added to the watchlist through the live app (not committed to the repo) won't durably persist. Running locally doesn't have this limitation.
+- **Apps sleep after inactivity.** The first visit after idle time shows a short "waking up" screen — this is expected free-tier behavior, not a bug.
+- **Filings retrieval is weaker than regulations retrieval** (0.375 vs. 0.769 precision) — a known, measured gap rather than an assumed one, tracked as an open item for future retrieval tuning.
+
+## Possible extensions
+
+- A critic/verifier agent that checks every claim against retrieved sources before the answer ships (sketched as an optional Week 7 in the original plan, not yet built).
+- Persistent, non-ephemeral watchlist storage for the deployed instance (e.g. a hosted database instead of local SQLite).
+
+---
+
+Built by Ronit Gupta as a structured, self-directed 6-week project.
